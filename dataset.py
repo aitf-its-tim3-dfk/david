@@ -120,6 +120,9 @@ class OptimizedVideoDataset(Dataset):
 
 def get_train_val_loaders(
     transform,
+    real_dirs=None,
+    fake_dirs=None,
+    max_per_dir=None,
     val_split=0.2,
     batch_size=16,
     num_workers=2,
@@ -127,9 +130,12 @@ def get_train_val_loaders(
 ):
     """Creates stratified train and validation dataloaders from a cache file."""
     if not os.path.exists(cache_path):
-        raise FileNotFoundError(
-            f"Cache file not found at {cache_path}. "
-            "Please run the initial dataloader script first."
+        print(f"Cache file not found at {cache_path}. Building it now...")
+        OptimizedVideoDataset(
+            real_video_dirs=real_dirs,
+            fake_video_dirs=fake_dirs,
+            max_files_per_folder=max_per_dir,
+            cache_path=cache_path
         )
 
     print(f"Loading and splitting file list from {cache_path}...")
