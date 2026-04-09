@@ -1,0 +1,16 @@
+# Core
+torch
+torchvision
+
+# CLIP tokenizer deps
+ftfy
+regex
+
+# Video loading
+decord
+
+# Metrics
+scikit-learn
+
+# Progress bars
+tqdm
