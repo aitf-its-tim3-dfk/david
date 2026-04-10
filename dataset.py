@@ -4,12 +4,16 @@ Video dataset and dataloader utilities for deepfake detection.
 
 import os
 import json
+import time
 import random
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2 as transforms
 from decord import VideoReader, cpu
+
+MAX_RETRIES = 15
+RETRY_BASE_DELAY = 1  # seconds
 
 
 class OptimizedVideoDataset(Dataset):
@@ -93,29 +97,42 @@ class OptimizedVideoDataset(Dataset):
 
     def __getitem__(self, idx):
         video_path, label = self.video_files[idx]
-        try:
-            vr = VideoReader(video_path, ctx=cpu(0))
-            total_frames = len(vr)
 
-            if total_frames > self.num_frames:
-                start_frame = random.randint(0, total_frames - self.num_frames)
-                frame_indices = range(start_frame, start_frame + self.num_frames)
-            else:
-                frame_indices = list(range(total_frames))
-                if len(frame_indices) < self.num_frames:
-                    frame_indices.extend(
-                        [total_frames - 1] * (self.num_frames - len(frame_indices))
+        for attempt in range(MAX_RETRIES):
+            try:
+                vr = VideoReader(video_path, ctx=cpu(0))
+                total_frames = len(vr)
+
+                if total_frames > self.num_frames:
+                    start_frame = random.randint(0, total_frames - self.num_frames)
+                    frame_indices = range(start_frame, start_frame + self.num_frames)
+                else:
+                    frame_indices = list(range(total_frames))
+                    if len(frame_indices) < self.num_frames:
+                        frame_indices.extend(
+                            [total_frames - 1] * (self.num_frames - len(frame_indices))
+                        )
+
+                video_frames = vr.get_batch(frame_indices).asnumpy()
+                video_tensor = torch.from_numpy(video_frames).permute(0, 3, 1, 2)
+
+                if self.transform:
+                    video_tensor = self.transform(video_tensor)
+                return video_tensor, int(label)
+
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
+                    print(
+                        f"[Retry {attempt + 1}/{MAX_RETRIES}] Error loading {video_path}: {e} "
+                        f"-- retrying in {delay:.1f}s..."
                     )
-
-            video_frames = vr.get_batch(frame_indices).asnumpy()
-            video_tensor = torch.from_numpy(video_frames).permute(0, 3, 1, 2)
-        except Exception as e:
-            print(f"Error loading video {video_path}: {e}")
-            return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
-
-        if self.transform:
-            video_tensor = self.transform(video_tensor)
-        return video_tensor, int(label)
+                    time.sleep(delay)
+                else:
+                    print(
+                        f"[FAILED] Gave up loading {video_path} after {MAX_RETRIES} attempts: {e}"
+                    )
+                    return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
 
 
 def get_train_val_loaders(
@@ -135,7 +152,7 @@ def get_train_val_loaders(
             real_video_dirs=real_dirs,
             fake_video_dirs=fake_dirs,
             max_files_per_folder=max_per_dir,
-            cache_path=cache_path
+            cache_path=cache_path,
         )
 
     print(f"Loading and splitting file list from {cache_path}...")
