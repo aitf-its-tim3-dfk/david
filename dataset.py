@@ -121,7 +121,9 @@ class OptimizedVideoDataset(Dataset):
                 return video_tensor, int(label)
 
             except Exception as e:
-                if attempt < MAX_RETRIES - 1:
+                is_retryable = "Error reading" in str(e)
+
+                if is_retryable and attempt < MAX_RETRIES - 1:
                     delay = RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
                     print(
                         f"[Retry {attempt + 1}/{MAX_RETRIES}] Error loading {video_path}: {e} "
@@ -129,9 +131,12 @@ class OptimizedVideoDataset(Dataset):
                     )
                     time.sleep(delay)
                 else:
-                    print(
-                        f"[FAILED] Gave up loading {video_path} after {MAX_RETRIES} attempts: {e}"
-                    )
+                    if is_retryable:
+                        print(
+                            f"[FAILED] Gave up loading {video_path} after {MAX_RETRIES} attempts: {e}"
+                        )
+                    else:
+                        print(f"[SKIP] Broken sample {video_path}: {e}")
                     return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
 
 
