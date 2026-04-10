@@ -65,6 +65,7 @@ class OptimizedVideoDataset(Dataset):
                     continue
                 print(f"Scanning {dir_path}...")
                 count = 0
+                skipped = 0
                 try:
                     with os.scandir(dir_path) as it:
                         for entry in it:
@@ -74,10 +75,22 @@ class OptimizedVideoDataset(Dataset):
                             if entry.is_file() and entry.name.lower().endswith(
                                 (".mp4", ".avi", ".mov", ".mkv")
                             ):
+                                # check if the video is actually readable
+                                try:
+                                    vr = VideoReader(entry.path, ctx=cpu(0))
+                                    if len(vr) < 1:
+                                        raise ValueError("0 frames")
+                                    del vr
+                                except Exception as e:
+                                    skipped += 1
+                                    print(f"  Skipping invalid video: {entry.name} ({e})")
+                                    continue
                                 video_list.append((entry.path, label))
                                 count += 1
                 except FileNotFoundError:
                     print(f"Warning: Directory scan failed for: {dir_path}")
+                if skipped > 0:
+                    print(f"  Skipped {skipped} invalid videos in {dir_path}.")
 
         scan_dirs(real_dirs, True)
         scan_dirs(fake_dirs, False)
