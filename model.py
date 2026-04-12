@@ -1,5 +1,9 @@
 """
-Classification head and transform definitions for the deepfake detector.
+Classification head variants and transform definitions for the deepfake detector.
+
+Available heads (set HEAD_TYPE in config.py):
+  "simple" — 1-layer MLP, lighter 
+  "deep"   — 3-layer MLP, more capacity (default)
 """
 
 import torch
@@ -17,8 +21,23 @@ class SwiGLU(nn.Module):
         return x * F.silu(gate)
 
 
-class ClassificationHead(nn.Module):
-    """MLP classification head with SwiGLU activation and dropout."""
+class SimpleHead(nn.Module):
+    """1-layer MLP head with SwiGLU. Matches the original swiglu_dropout script."""
+
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.dense = nn.Linear(input_dim, num_classes * 2)
+        self.dropout = nn.Dropout(0.1)
+        self.activation = SwiGLU()
+
+    def forward(self, x):
+        x = self.dense(x)
+        x = self.dropout(x)
+        return self.activation(x)
+
+
+class DeepHead(nn.Module):
+    """3-layer MLP head with SwiGLU activations and dropout."""
 
     def __init__(self, input_dim, num_classes):
         super().__init__()
@@ -37,6 +56,30 @@ class ClassificationHead(nn.Module):
         x = self.dropout(x)
         x = self.dense2(x)
         return x
+
+
+_HEADS = {
+    "simple": SimpleHead,
+    "deep": DeepHead,
+}
+
+
+def build_head(head_type, input_dim, num_classes):
+    """
+    Factory function — instantiate a classification head by name.
+
+    Parameters
+    ----------
+    head_type : str
+        One of "simple" or "deep".
+    input_dim : int
+        Feature dimension from the encoder (e.g. 512 for ViT-B/16).
+    num_classes : int
+        Number of output logits (1 for binary classification).
+    """
+    if head_type not in _HEADS:
+        raise ValueError(f"Unknown head_type '{head_type}'. Choose from: {list(_HEADS)}")
+    return _HEADS[head_type](input_dim, num_classes)
 
 
 def build_transform(n_px=224):

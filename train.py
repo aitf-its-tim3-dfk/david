@@ -8,10 +8,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.amp import GradScaler, autocast
 from sklearn.metrics import classification_report
 from tqdm import tqdm
 
-from model import ClassificationHead
+from model import build_head
 
 
 def set_seed(seed_value=42):
@@ -39,22 +40,43 @@ def _extract_features(feature_extractor, videos, device):
     return image_features.mean(dim=1)
 
 
-def train_one_epoch(classifier, feature_extractor, train_loader, criterion, optimizer, device, epoch, num_epochs):
-    """Runs a single training epoch."""
+def _build_scheduler(optimizer, scheduler_type, num_epochs, val_loader_len):
+    """Instantiate a LR scheduler by name. Returns None if scheduler_type is None."""
+    if scheduler_type == "cosine":
+        return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    if scheduler_type == "plateau":
+        return optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=2, factor=0.5)
+    return None
+
+
+def train_one_epoch(
+    classifier, feature_extractor, train_loader,
+    criterion, optimizer, device, epoch, num_epochs,
+    scaler=None,
+):
+    """Runs a single training epoch. Uses AMP if scaler is provided."""
     classifier.train()
     running_loss = 0.0
+    use_amp = scaler is not None
     print(f"\n--- Epoch {epoch + 1}/{num_epochs} | Training ---")
 
     for _, (videos, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
         labels = labels.to(device).float().unsqueeze(1)
         video_feature = _extract_features(feature_extractor, videos, device)
 
-        outputs = classifier(video_feature)
-        loss = criterion(outputs, labels)
+        with autocast(device_type=device.type, enabled=use_amp):
+            outputs = classifier(video_feature)
+            loss = criterion(outputs, labels)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
         running_loss += loss.item()
 
     avg_loss = running_loss / len(train_loader)
@@ -98,42 +120,82 @@ def run_training(
     val_loader,
     input_dim=512,
     num_classes=1,
+    head_type="deep",
     lr=1e-3,
     num_epochs=5,
     save_path="best_detector_model.pt",
+    use_amp=True,
+    lr_scheduler="cosine",
+    patience=3,
 ):
-    """Full training + evaluation pipeline."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    """Full training + evaluation pipeline.
 
-    print("Creating new classification head...")
-    classifier = ClassificationHead(input_dim=input_dim, num_classes=num_classes)
+    Parameters
+    ----------
+    use_amp : bool
+        Enable automatic mixed precision (faster, less VRAM). Default True.
+    lr_scheduler : str or None
+        "cosine" — CosineAnnealingLR over all epochs.
+        "plateau" — ReduceLROnPlateau, steps on val accuracy.
+        None — no scheduler, constant LR.
+    patience : int or None
+        Early stopping: stop if val accuracy does not improve for this many
+        consecutive epochs. None disables early stopping.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = use_amp and device.type == "cuda"  # AMP only meaningful on GPU
+    print(f"Using device: {device} | AMP: {use_amp} | Scheduler: {lr_scheduler} | Patience: {patience}")
+
+    print(f"Creating classification head: {head_type!r}")
+    classifier = build_head(head_type=head_type, input_dim=input_dim, num_classes=num_classes)
     classifier.to(device)
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(classifier.parameters(), lr=lr)
+    scaler = GradScaler(device=device.type) if use_amp else None
+    scheduler = _build_scheduler(optimizer, lr_scheduler, num_epochs, len(val_loader))
 
     best_val_accuracy = 0.0
+    epochs_no_improve = 0
 
     for epoch in range(num_epochs):
         train_one_epoch(
             classifier, feature_extractor, train_loader,
             criterion, optimizer, device, epoch, num_epochs,
+            scaler=scaler,
         )
-        _, val_accuracy, _, _ = validate(
+        val_loss, val_accuracy, _, _ = validate(
             classifier, feature_extractor, val_loader,
             criterion, device, epoch, num_epochs,
         )
 
+        # LR scheduler step
+        if scheduler is not None:
+            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_accuracy)
+            else:
+                scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"LR: {current_lr:.2e}")
+
+        # Checkpoint
         if val_accuracy > best_val_accuracy:
             best_val_accuracy = val_accuracy
+            epochs_no_improve = 0
             torch.save(classifier.state_dict(), save_path)
             print(f"New best model saved with accuracy: {best_val_accuracy * 100:.2f}%")
+        else:
+            epochs_no_improve += 1
 
-    # --- Final report with the best checkpoint ---
+        # Early stopping
+        if patience is not None and epochs_no_improve >= patience:
+            print(f"\nEarly stopping triggered — no improvement for {patience} epochs.")
+            break
+
+    # Final report with best checkpoint
     print("\n--- Training Complete ---")
     print(f"Loading best model from {save_path} for final report...")
-    classifier.load_state_dict(torch.load(save_path))
+    classifier.load_state_dict(torch.load(save_path, weights_only=True))
 
     _, _, all_preds, all_labels = validate(
         classifier, feature_extractor, val_loader, criterion, device,

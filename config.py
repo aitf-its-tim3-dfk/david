@@ -1,54 +1,93 @@
 """
-Paths and hyperparameters for the deepfake video detector.
+Config loader for the deepfake video detector.
 
-All Colab/Google Drive paths are kept here so the rest of the codebase
-stays environment-agnostic.
+Reads config.yaml if it exists. Any missing key falls back to the
+defaults defined here, so the repo works out-of-the-box without a
+YAML file and you only need to set what you want to override.
 """
 
 import os
+import yaml
 
-# ──────────────────────────────────────────────
-# Paths
-# ──────────────────────────────────────────────
-CACHE_PATH = "video_train_10000_cache_fixed_2.json"
-BEST_MODEL_SAVE_PATH = "best_detector_model.pt"
+# ── Defaults ──────────────────────────────────────────────────────────────────
+_DEFAULTS = {
+    "paths": {
+        "base_dir":              "/content/final_dataset",
+        "metadata_csv":          "/content/final_dataset/metadata.csv",
+        "best_model_save_path":  "best_detector_model.pt",
+        "vificlip_checkpoint":   None,
+    },
+    "model": {
+        "clip_arch":    "ViT-B/16",
+        "class_names":  ["true", "false"],
+        "head_type":    "deep",
+    },
+    "training": {
+        "learning_rate": 1e-3,
+        "batch_size":    4,
+        "num_epochs":    5,
+        "num_frames":    16,
+        "num_workers":   2,
+        "input_dim":     512,
+        "num_classes":   1,
+        "use_amp":       True,
+        "lr_scheduler":  "cosine",
+        "patience":      3,
+    },
+    "dataset": {
+        "val_split":   0.2,
+        "train_size":  None,
+        "val_size":    None,
+    },
+}
 
-# Where the finetuned ViFi-CLIP checkpoint lives (set to None to use base CLIP)
-VIFICLIP_CHECKPOINT = None  # or e.g. "/content/drive/MyDrive/vifi_clip_30_epochs_k400_full_finetuned.pth"
 
-DRIVE_CACHE_PATH = (
-    "/content/drive/MyDrive/data mining gemastik/"
-    "video train 10000/video_train_10000_cache_fixed_2.json"
-)
+def _deep_merge(defaults, overrides):
+    """Recursively merge overrides into defaults. Missing keys keep defaults."""
+    result = dict(defaults)
+    for key, val in overrides.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
 
-BASE_DIR = "/content/drive/MyDrive/data mining gemastik"
 
-REAL_VIDEO_PATHS = [
-    "/content/drive/.shortcut-targets-by-id/"
-    "1Wcbv564DV62urzCJvYmvnkDD_Z74ZKLa/GenVideo-Val/Real",
-    os.path.join(BASE_DIR, "K4/videos_val"),
-]
+def _load():
+    yaml_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    if os.path.exists(yaml_path):
+        with open(yaml_path) as f:
+            overrides = yaml.safe_load(f) or {}
+        return _deep_merge(_DEFAULTS, overrides)
+    return _DEFAULTS
 
-FAKE_VIDEO_PATHS = [
-    "/content/drive/MyDrive/gemastik-datmin/pika/train_pika",
-    os.path.join(BASE_DIR, "Sora/train_OpenSora"),
-    os.path.join(BASE_DIR, "SVD/train_SVD"),
-]
 
-# ──────────────────────────────────────────────
-# Model
-# ──────────────────────────────────────────────
-CLIP_ARCH = "ViT-B/16"
-CLASS_NAMES = ("true", "false")
+_cfg = _load()
 
-# ──────────────────────────────────────────────
-# Hyperparameters
-# ──────────────────────────────────────────────
-LEARNING_RATE = 1e-3
-BATCH_SIZE = 4
-NUM_EPOCHS = 5
-VAL_SPLIT = 0.2
-NUM_FRAMES = 16
-NUM_WORKERS = 2
-INPUT_DIM = 512
-NUM_CLASSES = 1
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE_DIR              = _cfg["paths"]["base_dir"]
+METADATA_CSV          = _cfg["paths"]["metadata_csv"]
+BEST_MODEL_SAVE_PATH  = _cfg["paths"]["best_model_save_path"]
+VIFICLIP_CHECKPOINT   = _cfg["paths"]["vificlip_checkpoint"]
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+CLIP_ARCH    = _cfg["model"]["clip_arch"]
+CLASS_NAMES  = tuple(_cfg["model"]["class_names"])
+HEAD_TYPE    = _cfg["model"]["head_type"]
+
+# ── Training ───────────────────────────────────────────────────────────────────
+LEARNING_RATE  = _cfg["training"]["learning_rate"]
+BATCH_SIZE     = _cfg["training"]["batch_size"]
+NUM_EPOCHS     = _cfg["training"]["num_epochs"]
+NUM_FRAMES     = _cfg["training"]["num_frames"]
+NUM_WORKERS    = _cfg["training"]["num_workers"]
+INPUT_DIM      = _cfg["training"]["input_dim"]
+NUM_CLASSES    = _cfg["training"]["num_classes"]
+USE_AMP        = _cfg["training"]["use_amp"]
+LR_SCHEDULER   = _cfg["training"]["lr_scheduler"]
+PATIENCE       = _cfg["training"]["patience"]
+
+# ── Dataset split ──────────────────────────────────────────────────────────────
+VAL_SPLIT   = _cfg["dataset"]["val_split"]
+TRAIN_SIZE  = _cfg["dataset"]["train_size"]
+VAL_SIZE    = _cfg["dataset"]["val_size"]

@@ -209,3 +209,6 @@ __marimo__/
 # Reference clone (not needed in repo)
 _vificlip_ref/
 _notebook_ref.ipynb
+
+.claude
+paper/paper.typ

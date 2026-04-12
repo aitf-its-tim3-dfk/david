@@ -1,0 +1,30 @@
+# DAViD Configuration
+# All fields are optional — missing keys fall back to defaults in config.py.
+
+paths:
+  base_dir: /content/final_dataset
+  metadata_csv: /content/final_dataset/metadata.csv
+  best_model_save_path: best_detector_model.pt
+  vificlip_checkpoint: null  # set to a .pth path to use finetuned weights
+
+model:
+  clip_arch: ViT-B/16
+  class_names: [true, false]
+  head_type: deep          # "simple" (1-layer) | "deep" (3-layer)
+
+training:
+  learning_rate: 1.0e-3
+  batch_size: 4
+  num_epochs: 5
+  num_frames: 16
+  num_workers: 2
+  input_dim: 512
+  num_classes: 1
+  use_amp: true            # mixed precision — disable if running on CPU
+  lr_scheduler: cosine     # "cosine" | "plateau" | null
+  patience: 3              # early stopping epochs; null to disable
+
+dataset:
+  val_split: 0.2           # used when train_size and val_size are both null
+  train_size: null         # e.g. 15000 — null means use all remaining after val
+  val_size: null           # e.g. 200   — null means use val_split ratio

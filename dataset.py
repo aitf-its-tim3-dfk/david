@@ -2,6 +2,7 @@
 Video dataset and dataloader utilities for deepfake detection.
 """
 
+import csv
 import os
 import json
 import time
@@ -11,6 +12,26 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2 as transforms
 from decord import VideoReader, cpu
+
+def load_from_csv(csv_path, base_dir):
+    """
+    Load video file list from a metadata CSV.
+
+    Expects columns: 'path' (relative to base_dir), 'class' ('real'/'fake'),
+    and 'label' (source name e.g. 'coin', 'SVD').
+    Returns a list of (abs_path, label_bool, source_str) tuples.
+    """
+    video_files = []
+    with open(csv_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            abs_path = os.path.join(base_dir, row["path"])
+            label = row["class"].strip().lower() == "real"
+            source = row.get("label", "unknown").strip()
+            video_files.append((abs_path, label, source))
+    print(f"Loaded {len(video_files)} videos from {csv_path}")
+    return video_files
+
 
 MAX_RETRIES = 15
 RETRY_BASE_DELAY = 1  # seconds
@@ -155,38 +176,76 @@ class OptimizedVideoDataset(Dataset):
 
 def get_train_val_loaders(
     transform,
+    csv_path=None,
+    base_dir=None,
     real_dirs=None,
     fake_dirs=None,
     max_per_dir=None,
     val_split=0.2,
+    train_size=None,
+    val_size=None,
     batch_size=16,
     num_workers=2,
     cache_path="video_train_10000_cache_fixed_2.json",
 ):
-    """Creates stratified train and validation dataloaders from a cache file."""
-    if not os.path.exists(cache_path):
-        print(f"Cache file not found at {cache_path}. Building it now...")
-        OptimizedVideoDataset(
-            real_video_dirs=real_dirs,
-            fake_video_dirs=fake_dirs,
-            max_files_per_folder=max_per_dir,
-            cache_path=cache_path,
-        )
+    """Creates stratified train and validation dataloaders.
 
-    print(f"Loading and splitting file list from {cache_path}...")
-    with open(cache_path, "r") as f:
-        master_list = json.load(f)
+    Two source modes:
+      1. CSV mode: provide csv_path and base_dir to load from a metadata CSV.
+      2. Legacy mode: provide real_dirs/fake_dirs or a pre-built cache_path JSON.
+
+    Two split modes:
+      - Ratio mode (default): val_split=0.2 splits 80/20. Used when train_size
+        and val_size are both None.
+      - Exact mode: set train_size and/or val_size to an integer. Val is carved
+        out first (proportional real/fake), then train_size samples are taken
+        from the remainder. Either can be None (= use all available).
+    """
+    if csv_path is not None:
+        master_list = load_from_csv(csv_path, base_dir)
+    else:
+        if not os.path.exists(cache_path):
+            print(f"Cache file not found at {cache_path}. Building it now...")
+            OptimizedVideoDataset(
+                real_video_dirs=real_dirs,
+                fake_video_dirs=fake_dirs,
+                max_files_per_folder=max_per_dir,
+                cache_path=cache_path,
+            )
+
+        print(f"Loading and splitting file list from {cache_path}...")
+        with open(cache_path, "r") as f:
+            master_list = json.load(f)
 
     real_videos = [item for item in master_list if item[1] is True]
     fake_videos = [item for item in master_list if item[1] is False]
     random.shuffle(real_videos)
     random.shuffle(fake_videos)
 
-    real_split_idx = int(len(real_videos) * (1 - val_split))
-    fake_split_idx = int(len(fake_videos) * (1 - val_split))
+    if train_size is not None or val_size is not None:
+        # Exact mode — preserve real/fake ratio within each split
+        total = len(real_videos) + len(fake_videos)
+        real_ratio = len(real_videos) / total
+        fake_ratio = len(fake_videos) / total
 
-    train_files = real_videos[:real_split_idx] + fake_videos[:fake_split_idx]
-    val_files = real_videos[real_split_idx:] + fake_videos[fake_split_idx:]
+        if val_size is not None:
+            n_val_real = min(round(val_size * real_ratio), len(real_videos))
+            n_val_fake = min(round(val_size * fake_ratio), len(fake_videos))
+        else:
+            n_val_real = int(len(real_videos) * val_split)
+            n_val_fake = int(len(fake_videos) * val_split)
+
+        val_files  = real_videos[:n_val_real] + fake_videos[:n_val_fake]
+        train_pool = real_videos[n_val_real:] + fake_videos[n_val_fake:]
+        random.shuffle(train_pool)
+        train_files = train_pool[:train_size] if train_size is not None else train_pool
+    else:
+        # Ratio mode
+        real_split_idx = int(len(real_videos) * (1 - val_split))
+        fake_split_idx = int(len(fake_videos) * (1 - val_split))
+        train_files = real_videos[:real_split_idx] + fake_videos[:fake_split_idx]
+        val_files   = real_videos[real_split_idx:] + fake_videos[fake_split_idx:]
+
     random.shuffle(train_files)
     random.shuffle(val_files)
 
@@ -199,10 +258,12 @@ def get_train_val_loaders(
     val_dataset = OptimizedVideoDataset(file_list=val_files, transform=transform)
 
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, val_files
