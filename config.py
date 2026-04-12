@@ -72,7 +72,7 @@ VIFICLIP_CHECKPOINT   = _cfg["paths"]["vificlip_checkpoint"]
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 CLIP_ARCH    = _cfg["model"]["clip_arch"]
-CLASS_NAMES  = tuple(_cfg["model"]["class_names"])
+CLASS_NAMES  = tuple(str(n) for n in _cfg["model"]["class_names"])
 HEAD_TYPE    = _cfg["model"]["head_type"]
 
 # ── Training ───────────────────────────────────────────────────────────────────

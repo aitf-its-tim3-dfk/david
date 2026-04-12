@@ -67,7 +67,7 @@ class ViFiCLIP(nn.Module):
         dtype = clip_model.dtype
 
         # Build simple text embeddings (no prompt learning)
-        prompts = [ctx_init.replace("_", " ") + " " + name + "." for name in class_names]
+        prompts = [ctx_init.replace("_", " ") + " " + str(name) + "." for name in class_names]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)

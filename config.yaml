@@ -1,5 +1,31 @@
 # DAViD Configuration
 # All fields are optional — missing keys fall back to defaults in config.py.
+#
+# ── Legacy Google Drive setup (pre-refactor) ──────────────────────────────────
+# To revert to the old structure (Drive mount + JSON cache instead of CSV),
+# replace the paths section with the following and call get_train_val_loaders()
+# without csv_path:
+#
+#   paths:
+#     base_dir: /content/drive/MyDrive/data mining gemastik
+#     best_model_save_path: best_detector_model.pt
+#     vificlip_checkpoint: /content/drive/MyDrive/vifi_clip_30_epochs_k400_full_finetuned.pth
+#
+# Then copy the cache locally in the notebook before training:
+#   CACHE_PATH       = "video_train_10000_cache_fixed_2.json"
+#   DRIVE_CACHE_PATH = "/content/drive/MyDrive/data mining gemastik/video train 10000/video_train_10000_cache_fixed_2.json"
+#   if not os.path.exists(CACHE_PATH):
+#       shutil.copy(DRIVE_CACHE_PATH, CACHE_PATH)
+#
+# Real video directories (legacy):
+#   /content/drive/.shortcut-targets-by-id/1Wcbv564DV62urzCJvYmvnkDD_Z74ZKLa/GenVideo-Val/Real
+#   /content/drive/MyDrive/data mining gemastik/K4/videos_val
+#
+# Fake video directories (legacy):
+#   /content/drive/MyDrive/gemastik-datmin/pika/train_pika
+#   /content/drive/MyDrive/data mining gemastik/Sora/train_OpenSora
+#   /content/drive/MyDrive/data mining gemastik/SVD/train_SVD
+# ─────────────────────────────────────────────────────────────────────────────
 
 paths:
   base_dir: /content/final_dataset
@@ -9,7 +35,7 @@ paths:
 
 model:
   clip_arch: ViT-B/16
-  class_names: [true, false]
+  class_names: ["true", "false"]
   head_type: deep          # "simple" (1-layer) | "deep" (3-layer)
 
 training:
