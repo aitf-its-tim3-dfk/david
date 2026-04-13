@@ -3,6 +3,7 @@ Training and evaluation loop for the deepfake video detector.
 """
 
 import random
+import time
 
 import numpy as np
 import torch
@@ -109,9 +110,14 @@ def train_one_epoch(
     classifier.train()
     running_loss = 0.0
     use_amp = scaler is not None
+    total_samples = 0
+    batch_times = []
     print(f"\n--- Epoch {epoch + 1}/{num_epochs} | Training ---")
 
+    epoch_start = time.perf_counter()
     for _, (videos, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
+        batch_start = time.perf_counter()
+
         labels = labels.to(device).float().unsqueeze(1)
         video_feature = _extract_features(feature_extractor, videos, device)
 
@@ -129,10 +135,20 @@ def train_one_epoch(
             optimizer.step()
 
         running_loss += loss.item()
+        total_samples += labels.size(0)
+        batch_times.append(time.perf_counter() - batch_start)
 
+    epoch_secs = time.perf_counter() - epoch_start
     avg_loss = running_loss / len(train_loader)
-    print(f"Average Training Loss: {avg_loss:.4f}")
-    return avg_loss
+    avg_batch_ms = (sum(batch_times) / len(batch_times)) * 1000
+    throughput = total_samples / epoch_secs
+
+    print(f"Average Training Loss: {avg_loss:.4f} | "
+          f"Epoch time: {epoch_secs:.1f}s | "
+          f"Batch: {avg_batch_ms:.1f}ms | "
+          f"Throughput: {throughput:.1f} samples/s")
+
+    return avg_loss, epoch_secs, avg_batch_ms, throughput
 
 
 def validate(classifier, feature_extractor, val_loader, criterion, device, epoch=None, num_epochs=None):
@@ -245,13 +261,18 @@ def run_training(
 
     best_val_accuracy = 0.0
     epochs_no_improve = 0
+    total_train_secs = 0.0
+
+    training_start = time.perf_counter()
 
     for epoch in range(num_epochs):
-        train_loss = train_one_epoch(
+        train_loss, epoch_secs, avg_batch_ms, throughput = train_one_epoch(
             classifier, feature_extractor, train_loader,
             criterion, optimizer, device, epoch, num_epochs,
             scaler=scaler,
         )
+        total_train_secs += epoch_secs
+
         val_loss, val_accuracy, _, _ = validate(
             classifier, feature_extractor, val_loader,
             criterion, device, epoch, num_epochs,
@@ -270,11 +291,15 @@ def run_training(
         # W&B per-epoch logging
         if use_wandb:
             wandb.log({
-                "epoch":        epoch + 1,
-                "train/loss":   train_loss,
-                "val/loss":     val_loss,
-                "val/accuracy": val_accuracy,
-                "train/lr":     current_lr,
+                "epoch":              epoch + 1,
+                "train/loss":         train_loss,
+                "val/loss":           val_loss,
+                "val/accuracy":       val_accuracy,
+                "train/lr":           current_lr,
+                "time/epoch_secs":    epoch_secs,
+                "time/batch_ms":      avg_batch_ms,
+                "time/throughput":    throughput,
+                "time/total_train_secs": total_train_secs,
             })
 
         # Checkpoint
@@ -307,6 +332,13 @@ def run_training(
     print(classification_report(all_labels, all_preds, target_names=target_names))
 
     # ── W&B artifact + finish ─────────────────────────────────────────────────
+    total_wall_secs = time.perf_counter() - training_start
+    print(f"\nTotal training time: {total_wall_secs/60:.1f} min")
+
+    if use_wandb:
+        wandb.run.summary["time/total_wall_secs"] = total_wall_secs
+        wandb.run.summary["time/total_wall_mins"] = round(total_wall_secs / 60, 2)
+
     if use_wandb:
         artifact = wandb.Artifact("detector-model", type="model",
                                   description="Best checkpoint by val accuracy")

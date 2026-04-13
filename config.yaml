@@ -33,6 +33,7 @@ paths:
   output_dir: /content/outputs
   best_model_save_path: /content/outputs/best_detector_model.pt
   clean_csv: /content/outputs/metadata_clean.csv
+  split_cache: /content/outputs/split_cache.json
   vificlip_checkpoint: null  # set to a .pth path to use finetuned weights
 
 model:

@@ -22,6 +22,7 @@ _DEFAULTS = {
         "output_dir":           "/content/outputs",
         "best_model_save_path": "/content/outputs/best_detector_model.pt",
         "clean_csv":            "/content/outputs/metadata_clean.csv",
+        "split_cache":          "/content/outputs/split_cache.json",
         "vificlip_checkpoint":  None,
     },
     "model": {
@@ -80,6 +81,7 @@ METADATA_CSV          = _cfg["paths"]["metadata_csv"]
 OUTPUT_DIR            = _cfg["paths"]["output_dir"]
 BEST_MODEL_SAVE_PATH  = _cfg["paths"]["best_model_save_path"]
 CLEAN_CSV             = _cfg["paths"]["clean_csv"]
+SPLIT_CACHE           = _cfg["paths"]["split_cache"]
 VIFICLIP_CHECKPOINT   = _cfg["paths"]["vificlip_checkpoint"]
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)

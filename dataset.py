@@ -341,6 +341,7 @@ def get_train_val_loaders(
     balance=False,
     min_seg_secs=5,
     max_seg_secs=10,
+    split_cache_path=None,
 ):
     """Creates stratified train and validation dataloaders.
 
@@ -374,6 +375,31 @@ def get_train_val_loaders(
         print(f"Loading and splitting file list from {cache_path}...")
         with open(cache_path, "r") as f:
             master_list = json.load(f)
+
+    # ── Split cache (load if exists) ──────────────────────────────────────────
+    if split_cache_path and os.path.exists(split_cache_path):
+        print(f"Split cache found, loading from: {split_cache_path}")
+        with open(split_cache_path, "r") as f:
+            cached = json.load(f)
+        train_files = [tuple(e) for e in cached["train"]]
+        val_files   = [tuple(e) for e in cached["val"]]
+        print(f"Loaded {len(train_files)} train, {len(val_files)} val entries from cache.")
+
+        train_dataset = OptimizedVideoDataset(
+            file_list=train_files, transform=transform, num_frames=num_frames
+        )
+        val_dataset = OptimizedVideoDataset(
+            file_list=val_files, transform=transform, num_frames=num_frames
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True,
+        )
+        return train_loader, val_loader, val_files
 
     # ── Balance mode ──────────────────────────────────────────────────────────
     if balance:
@@ -418,6 +444,13 @@ def get_train_val_loaders(
     random.shuffle(val_files)
 
     print(f"Dataset split: {len(train_files)} training, {len(val_files)} validation.")
+
+    # ── Save split cache ───────────────────────────────────────────────────────
+    if split_cache_path:
+        with open(split_cache_path, "w") as f:
+            json.dump({"train": [list(e) for e in train_files],
+                       "val":   [list(e) for e in val_files]}, f)
+        print(f"Split cache saved: {split_cache_path}")
 
     train_dataset = OptimizedVideoDataset(
         file_list=train_files, transform=transform, num_frames=num_frames
