@@ -11,11 +11,18 @@ import yaml
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 _DEFAULTS = {
+    "wandb": {
+        "enabled":  True,
+        "project":  "david-deepfake",
+        "run_name": None,
+    },
     "paths": {
-        "base_dir":              "/content/final_dataset",
-        "metadata_csv":          "/content/final_dataset/metadata.csv",
-        "best_model_save_path":  "best_detector_model.pt",
-        "vificlip_checkpoint":   None,
+        "base_dir":             "/content/final_dataset",
+        "metadata_csv":         "/content/final_dataset/metadata.csv",
+        "output_dir":           "/content/outputs",
+        "best_model_save_path": "/content/outputs/best_detector_model.pt",
+        "clean_csv":            "/content/outputs/metadata_clean.csv",
+        "vificlip_checkpoint":  None,
     },
     "model": {
         "clip_arch":    "ViT-B/16",
@@ -38,6 +45,7 @@ _DEFAULTS = {
         "val_split":   0.2,
         "train_size":  None,
         "val_size":    None,
+        "balance":     False,
     },
 }
 
@@ -67,8 +75,12 @@ _cfg = _load()
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR              = _cfg["paths"]["base_dir"]
 METADATA_CSV          = _cfg["paths"]["metadata_csv"]
+OUTPUT_DIR            = _cfg["paths"]["output_dir"]
 BEST_MODEL_SAVE_PATH  = _cfg["paths"]["best_model_save_path"]
+CLEAN_CSV             = _cfg["paths"]["clean_csv"]
 VIFICLIP_CHECKPOINT   = _cfg["paths"]["vificlip_checkpoint"]
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 CLIP_ARCH    = _cfg["model"]["clip_arch"]
@@ -91,3 +103,9 @@ PATIENCE       = _cfg["training"]["patience"]
 VAL_SPLIT   = _cfg["dataset"]["val_split"]
 TRAIN_SIZE  = _cfg["dataset"]["train_size"]
 VAL_SIZE    = _cfg["dataset"]["val_size"]
+BALANCE     = _cfg["dataset"]["balance"]
+
+# ── W&B ────────────────────────────────────────────────────────────────────────
+WANDB_ENABLED   = _cfg["wandb"]["enabled"]
+WANDB_PROJECT   = _cfg["wandb"]["project"]
+WANDB_RUN_NAME  = _cfg["wandb"]["run_name"]

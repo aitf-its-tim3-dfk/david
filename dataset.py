@@ -7,11 +7,13 @@ import os
 import json
 import time
 import random
+from collections import defaultdict
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2 as transforms
 from decord import VideoReader, cpu
+
 
 def _is_valid_video(path):
     """Return True if DECORD can open the file, has frames, and can read one."""
@@ -24,6 +26,85 @@ def _is_valid_video(path):
         return True
     except Exception:
         return False
+
+
+def _get_video_frames(path):
+    """Return total frame count of a video, or 0 on error."""
+    try:
+        vr = VideoReader(path, ctx=cpu(0))
+        n = len(vr)
+        del vr
+        return n
+    except Exception:
+        return 0
+
+
+def _expand_source_to_target(videos, target, num_frames):
+    """
+    Produce exactly `target` clip entries from a source's video list.
+
+    Each entry is a 4-tuple: (path, label, source, start_frame)
+    where start_frame=-1 means "random start" (single-clip, data-aug friendly).
+
+    If len(videos) >= target: undersample to target, 1 clip each.
+    If len(videos) < target: use all videos (1 clip each) + split long videos
+      greedily until target reached or exhausted.
+
+    A video is eligible for splitting only if:
+      total_frames >= 2 * num_frames  (can yield ≥ 2 clips)
+      total_frames >= 120             (proxy for ≥ 5s at 24fps)
+    """
+    from tqdm import tqdm
+
+    MIN_SPLIT_FRAMES = max(2 * num_frames, 120)
+
+    if not videos:
+        return []
+
+    if len(videos) >= target:
+        sampled = random.sample(videos, target)
+        return [(v[0], v[1], v[2], -1) for v in sampled]
+
+    # Below target — use all + try to expand long videos
+    clips = [(v[0], v[1], v[2], -1) for v in videos]
+    gap = target - len(videos)
+
+    if gap <= 0:
+        return clips
+
+    source_name = videos[0][2] if videos else "unknown"
+
+    # Get frame counts only for videos that might be splittable
+    candidates = []
+    for v in tqdm(videos, desc=f"  Scanning '{source_name}' for splits", leave=False):
+        n = _get_video_frames(v[0])
+        if n >= MIN_SPLIT_FRAMES:
+            candidates.append((v, n))
+
+    # Sort by frame count desc — most splittable first
+    candidates.sort(key=lambda x: x[1], reverse=True)
+
+    for v, n_frames in candidates:
+        if gap <= 0:
+            break
+        max_extra = (n_frames // num_frames) - 1
+        extra = min(max_extra, gap)
+        total_clips = 1 + extra  # existing clip + extra clips
+
+        # Replace the existing single-clip entry for this video with
+        # segment-based entries so each clip covers a different part of the video.
+        clips = [c for c in clips if c[0] != v[0]]
+        seg_size = n_frames // total_clips
+        for seg_idx in range(total_clips):
+            seg_start = seg_idx * seg_size
+            seg_end = seg_start + seg_size if seg_idx < total_clips - 1 else n_frames
+            clips.append((v[0], v[1], v[2], seg_start, seg_end))
+        gap -= extra
+
+    if gap > 0:
+        print(f"  [balance] '{source_name}': {gap} clips short of target (not enough long videos)")
+
+    return clips
 
 
 def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
@@ -65,7 +146,7 @@ def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
         video_files.append((abs_path, label, source))
 
     print(f"Loaded {len(video_files)} videos from {csv_path}" +
-          (f" ({skipped} broken files skipped)" if skipped else ""))
+          (f" ({skipped} broken/non-video files skipped)" if skipped else ""))
 
     if clean_csv_path and validate:
         with open(clean_csv_path, "w", newline="") as f:
@@ -88,9 +169,9 @@ class OptimizedVideoDataset(Dataset):
     """
     Custom PyTorch Dataset for loading videos.
 
-    Can be initialized in two ways:
-      1. By providing `real_video_dirs` and `fake_video_dirs` to scan.
-      2. By providing a pre-made `file_list`.
+    Accepts file_list entries as 2-tuple (path, label), 3-tuple (path, label, source),
+    or 4-tuple (path, label, source, start_frame). When start_frame >= 0, frames are
+    read from that fixed position (multi-clip mode). start_frame=-1 means random start.
     """
 
     def __init__(
@@ -143,7 +224,6 @@ class OptimizedVideoDataset(Dataset):
                             if entry.is_file() and entry.name.lower().endswith(
                                 (".mp4", ".avi", ".mov", ".mkv")
                             ):
-                                # check if the video is actually readable
                                 try:
                                     vr = VideoReader(entry.path, ctx=cpu(0))
                                     if len(vr) < 1:
@@ -177,7 +257,11 @@ class OptimizedVideoDataset(Dataset):
         return len(self.video_files)
 
     def __getitem__(self, idx):
-        video_path, label, _ = self.video_files[idx]
+        entry = self.video_files[idx]
+        video_path = entry[0]
+        label = entry[1]
+        # 4-tuple: fixed start_frame (-1 = random, >=0 = fixed clip position)
+        fixed_start = int(entry[3]) if len(entry) > 3 else None
 
         if video_path in _broken_files:
             return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
@@ -187,15 +271,27 @@ class OptimizedVideoDataset(Dataset):
                 vr = VideoReader(video_path, ctx=cpu(0))
                 total_frames = len(vr)
 
-                if total_frames > self.num_frames:
-                    start_frame = random.randint(0, total_frames - self.num_frames)
-                    frame_indices = range(start_frame, start_frame + self.num_frames)
+                if len(entry) == 5:
+                    # Segment mode: random start within [seg_start, seg_end - num_frames]
+                    seg_start = int(entry[3])
+                    seg_end = int(entry[4])
+                    max_start = max(seg_start, seg_end - self.num_frames)
+                    start = random.randint(seg_start, max_start)
+                elif fixed_start is not None and fixed_start >= 0:
+                    # Legacy fixed-start clip (4-tuple, kept for backward compat)
+                    start = min(fixed_start, max(0, total_frames - self.num_frames))
+                elif total_frames > self.num_frames:
+                    start = random.randint(0, total_frames - self.num_frames)
+                else:
+                    start = 0
+
+                if total_frames >= self.num_frames:
+                    frame_indices = list(range(start, start + self.num_frames))
                 else:
                     frame_indices = list(range(total_frames))
-                    if len(frame_indices) < self.num_frames:
-                        frame_indices.extend(
-                            [total_frames - 1] * (self.num_frames - len(frame_indices))
-                        )
+                    frame_indices.extend(
+                        [total_frames - 1] * (self.num_frames - total_frames)
+                    )
 
                 video_frames = vr.get_batch(frame_indices).asnumpy()
                 video_tensor = torch.from_numpy(video_frames).permute(0, 3, 1, 2)
@@ -208,7 +304,7 @@ class OptimizedVideoDataset(Dataset):
                 is_retryable = "Error reading" in str(e)
 
                 if is_retryable and attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
+                    delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
                     print(
                         f"[Retry {attempt + 1}/{MAX_RETRIES}] Error loading {video_path}: {e} "
                         f"-- retrying in {delay:.1f}s..."
@@ -216,9 +312,7 @@ class OptimizedVideoDataset(Dataset):
                     time.sleep(delay)
                 else:
                     if is_retryable:
-                        print(
-                            f"[FAILED] Gave up loading {video_path} after {MAX_RETRIES} attempts: {e}"
-                        )
+                        print(f"[FAILED] Gave up loading {video_path} after {MAX_RETRIES} attempts: {e}")
                     else:
                         print(f"[SKIP] Broken sample {video_path}: {e}")
                     _broken_files.add(video_path)
@@ -237,30 +331,32 @@ def get_train_val_loaders(
     val_size=None,
     batch_size=16,
     num_workers=2,
+    num_frames=16,
     cache_path="video_train_10000_cache_fixed_2.json",
     validate=False,
     clean_csv_path=None,
+    balance=False,
 ):
     """Creates stratified train and validation dataloaders.
 
     Two source modes:
-      1. CSV mode: provide csv_path and base_dir to load from a metadata CSV.
-      2. Legacy mode: provide real_dirs/fake_dirs or a pre-built cache_path JSON.
+      1. CSV mode: provide csv_path and base_dir.
+      2. Legacy mode: provide real_dirs/fake_dirs or cache_path JSON.
 
-    Two split modes:
-      - Ratio mode (default): val_split=0.2 splits 80/20. Used when train_size
-        and val_size are both None.
-      - Exact mode: set train_size and/or val_size to an integer. Val is carved
-        out first (proportional real/fake), then train_size samples are taken
-        from the remainder. Either can be None (= use all available).
+    Three split modes:
+      - Ratio mode (default): val_split=0.2. Used when train_size and val_size are None.
+      - Exact mode: set train_size and/or val_size to an integer.
+      - Balance mode: balance=True equalises clips per source within each class,
+        with video-level splitting to avoid leakage.
     """
     if csv_path is not None:
-        # If clean CSV already exists, load it directly (skip re-validation)
         if clean_csv_path and os.path.exists(clean_csv_path):
             print(f"Clean CSV found, loading from: {clean_csv_path}")
             master_list = load_from_csv(clean_csv_path, base_dir)
         else:
-            master_list = load_from_csv(csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path)
+            master_list = load_from_csv(
+                csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path
+            )
     else:
         if not os.path.exists(cache_path):
             print(f"Cache file not found at {cache_path}. Building it now...")
@@ -270,50 +366,56 @@ def get_train_val_loaders(
                 max_files_per_folder=max_per_dir,
                 cache_path=cache_path,
             )
-
         print(f"Loading and splitting file list from {cache_path}...")
         with open(cache_path, "r") as f:
             master_list = json.load(f)
 
-    real_videos = [item for item in master_list if item[1] is True]
-    fake_videos = [item for item in master_list if item[1] is False]
-    random.shuffle(real_videos)
-    random.shuffle(fake_videos)
+    # ── Balance mode ──────────────────────────────────────────────────────────
+    if balance:
+        train_files, val_files = _balanced_split(
+            master_list, val_split=val_split, num_frames=num_frames
+        )
 
-    if train_size is not None or val_size is not None:
-        # Exact mode — preserve real/fake ratio within each split
-        total = len(real_videos) + len(fake_videos)
-        real_ratio = len(real_videos) / total
-        fake_ratio = len(fake_videos) / total
-
-        if val_size is not None:
-            n_val_real = min(round(val_size * real_ratio), len(real_videos))
-            n_val_fake = min(round(val_size * fake_ratio), len(fake_videos))
-        else:
-            n_val_real = int(len(real_videos) * val_split)
-            n_val_fake = int(len(fake_videos) * val_split)
-
-        val_files  = real_videos[:n_val_real] + fake_videos[:n_val_fake]
-        train_pool = real_videos[n_val_real:] + fake_videos[n_val_fake:]
-        random.shuffle(train_pool)
-        train_files = train_pool[:train_size] if train_size is not None else train_pool
+    # ── Standard split modes ──────────────────────────────────────────────────
     else:
-        # Ratio mode
-        real_split_idx = int(len(real_videos) * (1 - val_split))
-        fake_split_idx = int(len(fake_videos) * (1 - val_split))
-        train_files = real_videos[:real_split_idx] + fake_videos[:fake_split_idx]
-        val_files   = real_videos[real_split_idx:] + fake_videos[fake_split_idx:]
+        real_videos = [item for item in master_list if item[1] is True]
+        fake_videos = [item for item in master_list if item[1] is False]
+        random.shuffle(real_videos)
+        random.shuffle(fake_videos)
+
+        if train_size is not None or val_size is not None:
+            total = len(real_videos) + len(fake_videos)
+            real_ratio = len(real_videos) / total
+            fake_ratio = len(fake_videos) / total
+
+            if val_size is not None:
+                n_val_real = min(round(val_size * real_ratio), len(real_videos))
+                n_val_fake = min(round(val_size * fake_ratio), len(fake_videos))
+            else:
+                n_val_real = int(len(real_videos) * val_split)
+                n_val_fake = int(len(fake_videos) * val_split)
+
+            val_files  = real_videos[:n_val_real] + fake_videos[:n_val_fake]
+            train_pool = real_videos[n_val_real:] + fake_videos[n_val_fake:]
+            random.shuffle(train_pool)
+            train_files = train_pool[:train_size] if train_size is not None else train_pool
+        else:
+            real_split_idx = int(len(real_videos) * (1 - val_split))
+            fake_split_idx = int(len(fake_videos) * (1 - val_split))
+            train_files = real_videos[:real_split_idx] + fake_videos[:fake_split_idx]
+            val_files   = real_videos[real_split_idx:] + fake_videos[fake_split_idx:]
 
     random.shuffle(train_files)
     random.shuffle(val_files)
 
-    print(
-        f"Dataset split: {len(train_files)} training files, "
-        f"{len(val_files)} validation files."
-    )
+    print(f"Dataset split: {len(train_files)} training, {len(val_files)} validation.")
 
-    train_dataset = OptimizedVideoDataset(file_list=train_files, transform=transform)
-    val_dataset = OptimizedVideoDataset(file_list=val_files, transform=transform)
+    train_dataset = OptimizedVideoDataset(
+        file_list=train_files, transform=transform, num_frames=num_frames
+    )
+    val_dataset = OptimizedVideoDataset(
+        file_list=val_files, transform=transform, num_frames=num_frames
+    )
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
@@ -325,3 +427,69 @@ def get_train_val_loaders(
     )
 
     return train_loader, val_loader, val_files
+
+
+def _balanced_split(master_list, val_split=0.2, num_frames=16):
+    """
+    Video-level split with per-source balance and optional multi-clip expansion.
+
+    Within each class (real/fake):
+      - Split videos per source at video level (no leakage)
+      - Target = min(source video count) across sources in that class
+      - Sources below target expand long videos into extra clips
+
+    Then balance real total vs fake total by undersampling the majority.
+    Returns (train_files, val_files) as lists of 4-tuples.
+    """
+    # Group by (label, source)
+    groups = defaultdict(list)
+    for item in master_list:
+        key = (item[1], item[2] if len(item) > 2 else "unknown")
+        groups[key].append(item)
+
+    real_groups = {k: v for k, v in groups.items() if k[0] is True}
+    fake_groups = {k: v for k, v in groups.items() if k[0] is False}
+
+    train_files = []
+    val_files = []
+
+    for class_name, class_groups in [("Real", real_groups), ("Fake", fake_groups)]:
+        if not class_groups:
+            continue
+
+        # Video-level split per source
+        source_train = {}
+        source_val = {}
+        for key, videos in class_groups.items():
+            vids = list(videos)
+            random.shuffle(vids)
+            n_val = max(1, int(len(vids) * val_split))
+            source_val[key] = vids[:n_val]
+            source_train[key] = vids[n_val:]
+
+        train_target = min(len(v) for v in source_train.values())
+        val_target = max(1, round(train_target * val_split / (1 - val_split)))
+
+        print(f"\n{class_name} sources (target: {train_target} train clips, {val_target} val clips per source):")
+
+        for key in class_groups:
+            _, source = key
+            t_clips = _expand_source_to_target(source_train[key], train_target, num_frames)
+            v_clips = _expand_source_to_target(source_val[key], val_target, num_frames)
+            train_files.extend(t_clips)
+            val_files.extend(v_clips)
+            print(f"  {source:<15} train: {len(source_train[key])} vids → {len(t_clips)} clips | "
+                  f"val: {len(source_val[key])} vids → {len(v_clips)} clips")
+
+    # Balance real vs fake totals
+    for split_name, files_list in [("train", train_files), ("val", val_files)]:
+        real_part = [f for f in files_list if f[1] is True]
+        fake_part = [f for f in files_list if f[1] is False]
+        min_count = min(len(real_part), len(fake_part))
+        balanced = random.sample(real_part, min_count) + random.sample(fake_part, min_count)
+        if split_name == "train":
+            train_files = balanced
+        else:
+            val_files = balanced
+
+    return train_files, val_files

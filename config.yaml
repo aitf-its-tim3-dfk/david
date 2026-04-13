@@ -30,7 +30,9 @@
 paths:
   base_dir: /content/final_dataset
   metadata_csv: /content/final_dataset/metadata.csv
-  best_model_save_path: best_detector_model.pt
+  output_dir: /content/outputs
+  best_model_save_path: /content/outputs/best_detector_model.pt
+  clean_csv: /content/outputs/metadata_clean.csv
   vificlip_checkpoint: null  # set to a .pth path to use finetuned weights
 
 model:
@@ -54,3 +56,9 @@ dataset:
   val_split: 0.2           # used when train_size and val_size are both null
   train_size: null         # e.g. 15000 — null means use all remaining after val
   val_size: null           # e.g. 200   — null means use val_split ratio
+  balance: false           # true = equal clips per source within each class (no leakage)
+
+wandb:
+  enabled: true            # set false to disable W&B logging
+  project: david-deepfake  # W&B project name
+  run_name: null           # custom run display name; null = auto-generated

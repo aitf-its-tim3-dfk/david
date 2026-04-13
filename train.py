@@ -127,6 +127,10 @@ def run_training(
     use_amp=True,
     lr_scheduler="cosine",
     patience=3,
+    use_wandb=False,
+    wandb_project="david-deepfake",
+    wandb_run_name=None,
+    wandb_extra_config=None,
 ):
     """Full training + evaluation pipeline.
 
@@ -141,10 +145,38 @@ def run_training(
     patience : int or None
         Early stopping: stop if val accuracy does not improve for this many
         consecutive epochs. None disables early stopping.
+    use_wandb : bool
+        Log metrics and artifacts to Weights & Biases.
+    wandb_project : str
+        W&B project name.
+    wandb_run_name : str, optional
+        W&B run display name. Auto-generated if None.
+    wandb_extra_config : dict, optional
+        Extra keys to merge into the W&B run config (e.g. clip_arch, class_names).
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = use_amp and device.type == "cuda"  # AMP only meaningful on GPU
+    use_amp = use_amp and device.type == "cuda"
     print(f"Using device: {device} | AMP: {use_amp} | Scheduler: {lr_scheduler} | Patience: {patience}")
+
+    # ── W&B init ──────────────────────────────────────────────────────────────
+    if use_wandb:
+        import wandb
+        run_config = {
+            "head_type":    head_type,
+            "lr":           lr,
+            "num_epochs":   num_epochs,
+            "input_dim":    input_dim,
+            "num_classes":  num_classes,
+            "use_amp":      use_amp,
+            "lr_scheduler": lr_scheduler,
+            "patience":     patience,
+            "train_size":   len(train_loader.dataset),
+            "val_size":     len(val_loader.dataset),
+            "batch_size":   train_loader.batch_size,
+        }
+        if wandb_extra_config:
+            run_config.update(wandb_extra_config)
+        wandb.init(project=wandb_project, name=wandb_run_name, config=run_config)
 
     print(f"Creating classification head: {head_type!r}")
     classifier = build_head(head_type=head_type, input_dim=input_dim, num_classes=num_classes)
@@ -159,7 +191,7 @@ def run_training(
     epochs_no_improve = 0
 
     for epoch in range(num_epochs):
-        train_one_epoch(
+        train_loss = train_one_epoch(
             classifier, feature_extractor, train_loader,
             criterion, optimizer, device, epoch, num_epochs,
             scaler=scaler,
@@ -170,6 +202,7 @@ def run_training(
         )
 
         # LR scheduler step
+        current_lr = optimizer.param_groups[0]["lr"]
         if scheduler is not None:
             if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(val_accuracy)
@@ -178,12 +211,24 @@ def run_training(
             current_lr = optimizer.param_groups[0]["lr"]
             print(f"LR: {current_lr:.2e}")
 
+        # W&B per-epoch logging
+        if use_wandb:
+            wandb.log({
+                "epoch":        epoch + 1,
+                "train/loss":   train_loss,
+                "val/loss":     val_loss,
+                "val/accuracy": val_accuracy,
+                "train/lr":     current_lr,
+            })
+
         # Checkpoint
         if val_accuracy > best_val_accuracy:
             best_val_accuracy = val_accuracy
             epochs_no_improve = 0
             torch.save(classifier.state_dict(), save_path)
             print(f"New best model saved with accuracy: {best_val_accuracy * 100:.2f}%")
+            if use_wandb:
+                wandb.run.summary["best_val_accuracy"] = best_val_accuracy
         else:
             epochs_no_improve += 1
 
@@ -204,5 +249,13 @@ def run_training(
     print("\n--- Final Performance Report (on validation set) ---")
     target_names = ["Fake (0)", "Real (1)"]
     print(classification_report(all_labels, all_preds, target_names=target_names))
+
+    # ── W&B artifact + finish ─────────────────────────────────────────────────
+    if use_wandb:
+        artifact = wandb.Artifact("detector-model", type="model",
+                                  description="Best checkpoint by val accuracy")
+        artifact.add_file(save_path)
+        wandb.log_artifact(artifact)
+        wandb.finish()
 
     return classifier

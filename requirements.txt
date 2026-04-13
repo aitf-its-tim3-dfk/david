@@ -17,3 +17,6 @@ tqdm
 
 # Config
 pyyaml
+
+# Experiment tracking
+wandb
