@@ -42,10 +42,12 @@ _DEFAULTS = {
         "patience":      3,
     },
     "dataset": {
-        "val_split":   0.2,
-        "train_size":  None,
-        "val_size":    None,
-        "balance":     True,
+        "val_split":    0.2,
+        "train_size":   None,
+        "val_size":     None,
+        "balance":      True,
+        "min_seg_secs": 5,
+        "max_seg_secs": 10,
     },
 }
 
@@ -100,10 +102,12 @@ LR_SCHEDULER   = _cfg["training"]["lr_scheduler"]
 PATIENCE       = _cfg["training"]["patience"]
 
 # ── Dataset split ──────────────────────────────────────────────────────────────
-VAL_SPLIT   = _cfg["dataset"]["val_split"]
-TRAIN_SIZE  = _cfg["dataset"]["train_size"]
-VAL_SIZE    = _cfg["dataset"]["val_size"]
-BALANCE     = _cfg["dataset"]["balance"]
+VAL_SPLIT     = _cfg["dataset"]["val_split"]
+TRAIN_SIZE    = _cfg["dataset"]["train_size"]
+VAL_SIZE      = _cfg["dataset"]["val_size"]
+BALANCE       = _cfg["dataset"]["balance"]
+MIN_SEG_SECS  = _cfg["dataset"]["min_seg_secs"]
+MAX_SEG_SECS  = _cfg["dataset"]["max_seg_secs"]
 
 # ── W&B ────────────────────────────────────────────────────────────────────────
 WANDB_ENABLED   = _cfg["wandb"]["enabled"]

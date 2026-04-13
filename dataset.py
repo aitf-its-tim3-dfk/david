@@ -39,72 +39,75 @@ def _get_video_frames(path):
         return 0
 
 
-def _expand_source_to_target(videos, target, num_frames):
+def _expand_source_to_target(videos, target, num_frames, min_seg_frames=150, max_seg_frames=300):
     """
-    Produce exactly `target` clip entries from a source's video list.
+    Produce up to `target` clip entries from a source's video list.
 
-    Each entry is a 4-tuple: (path, label, source, start_frame)
-    where start_frame=-1 means "random start" (single-clip, data-aug friendly).
+    Each entry is either:
+      - 4-tuple (path, label, source, -1)        → random start, whole video
+      - 5-tuple (path, label, source, seg_start, seg_end) → random start within segment
 
-    If len(videos) >= target: undersample to target, 1 clip each.
-    If len(videos) < target: use all videos (1 clip each) + split long videos
-      greedily until target reached or exhausted.
+    If len(videos) >= target: undersample to target, 1 clip each (no splitting).
+    If len(videos) < target: use all + split long videos greedily.
 
-    A video is eligible for splitting only if:
-      total_frames >= 2 * num_frames  (can yield ≥ 2 clips)
-      total_frames >= 120             (proxy for ≥ 5s at 24fps)
+    A video is splittable only if total_frames >= 2 * min_seg_frames.
+    Max clips per video = total_frames // min_seg_frames (enforces min segment duration).
+
+    Returns (clips, deficit) where deficit = target - len(clips).
     """
     from tqdm import tqdm
 
-    MIN_SPLIT_FRAMES = max(2 * num_frames, 120)
-
     if not videos:
-        return []
+        return [], target
 
     if len(videos) >= target:
         sampled = random.sample(videos, target)
-        return [(v[0], v[1], v[2], -1) for v in sampled]
+        return [(v[0], v[1], v[2], -1) for v in sampled], 0
 
     # Below target — use all + try to expand long videos
     clips = [(v[0], v[1], v[2], -1) for v in videos]
     gap = target - len(videos)
-
-    if gap <= 0:
-        return clips
-
     source_name = videos[0][2] if videos else "unknown"
 
-    # Get frame counts only for videos that might be splittable
+    # Get frame counts for splittable candidates
     candidates = []
     for v in tqdm(videos, desc=f"  Scanning '{source_name}' for splits", leave=False):
         n = _get_video_frames(v[0])
-        if n >= MIN_SPLIT_FRAMES:
-            candidates.append((v, n))
+        max_clips = n // min_seg_frames  # min segment constraint → max clips
+        if max_clips >= 2:
+            candidates.append((v, n, max_clips))
 
-    # Sort by frame count desc — most splittable first
     candidates.sort(key=lambda x: x[1], reverse=True)
 
-    for v, n_frames in candidates:
+    for v, n_frames, max_clips in candidates:
         if gap <= 0:
             break
-        max_extra = (n_frames // num_frames) - 1
+        max_extra = max_clips - 1
         extra = min(max_extra, gap)
-        total_clips = 1 + extra  # existing clip + extra clips
+        total_clips = 1 + extra
 
-        # Replace the existing single-clip entry for this video with
-        # segment-based entries so each clip covers a different part of the video.
         clips = [c for c in clips if c[0] != v[0]]
-        seg_size = n_frames // total_clips
+
+        # Assign segments with random duration between min and max seg frames
+        pos = 0
         for seg_idx in range(total_clips):
-            seg_start = seg_idx * seg_size
-            seg_end = seg_start + seg_size if seg_idx < total_clips - 1 else n_frames
+            seg_start = pos
+            if seg_idx < total_clips - 1:
+                seg_len = random.randint(min_seg_frames, max(min_seg_frames, max_seg_frames))
+                seg_end = min(seg_start + seg_len, n_frames)
+            else:
+                seg_end = n_frames  # last segment takes the rest
             clips.append((v[0], v[1], v[2], seg_start, seg_end))
+            pos = seg_end
+            if pos >= n_frames:
+                break
         gap -= extra
 
-    if gap > 0:
-        print(f"  [balance] '{source_name}': {gap} clips short of target (not enough long videos)")
+    deficit = target - len(clips)
+    if deficit > 0:
+        print(f"  [balance] '{source_name}': {deficit} clips short (min_seg={min_seg_frames}f)")
 
-    return clips
+    return clips, deficit
 
 
 def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
@@ -336,6 +339,8 @@ def get_train_val_loaders(
     validate=False,
     clean_csv_path=None,
     balance=False,
+    min_seg_secs=5,
+    max_seg_secs=10,
 ):
     """Creates stratified train and validation dataloaders.
 
@@ -372,8 +377,12 @@ def get_train_val_loaders(
 
     # ── Balance mode ──────────────────────────────────────────────────────────
     if balance:
+        min_seg_frames = int(min_seg_secs * 30)  # assume ~30fps as proxy
+        max_seg_frames = int(max_seg_secs * 30)
         train_files, val_files = _balanced_split(
-            master_list, val_split=val_split, num_frames=num_frames
+            master_list, val_split=val_split, num_frames=num_frames,
+            train_size=train_size, val_size=val_size,
+            min_seg_frames=min_seg_frames, max_seg_frames=max_seg_frames,
         )
 
     # ── Standard split modes ──────────────────────────────────────────────────
@@ -429,19 +438,20 @@ def get_train_val_loaders(
     return train_loader, val_loader, val_files
 
 
-def _balanced_split(master_list, val_split=0.2, num_frames=16):
+def _balanced_split(master_list, val_split=0.2, num_frames=16,
+                    train_size=None, val_size=None, min_seg_frames=150, max_seg_frames=300):
     """
     Video-level split with per-source balance and optional multi-clip expansion.
 
-    Within each class (real/fake):
-      - Split videos per source at video level (no leakage)
-      - Target = min(source video count) across sources in that class
-      - Sources below target expand long videos into extra clips
+    Target per source:
+      - If train_size provided: train_size // 2 // n_sources (equal real & fake halves)
+      - Otherwise: min(source video count) across sources in that class
 
-    Then balance real total vs fake total by undersampling the majority.
-    Returns (train_files, val_files) as lists of 4-tuples.
+    If a source can't reach target (limited by min_seg_frames), its deficit is
+    redistributed to other sources in the same class that have surplus capacity.
+
+    Returns (train_files, val_files).
     """
-    # Group by (label, source)
     groups = defaultdict(list)
     for item in master_list:
         key = (item[1], item[2] if len(item) > 2 else "unknown")
@@ -457,6 +467,8 @@ def _balanced_split(master_list, val_split=0.2, num_frames=16):
         if not class_groups:
             continue
 
+        n_sources = len(class_groups)
+
         # Video-level split per source
         source_train = {}
         source_val = {}
@@ -467,29 +479,72 @@ def _balanced_split(master_list, val_split=0.2, num_frames=16):
             source_val[key] = vids[:n_val]
             source_train[key] = vids[n_val:]
 
-        train_target = min(len(v) for v in source_train.values())
-        val_target = max(1, round(train_target * val_split / (1 - val_split)))
+        # Determine target clips per source
+        if train_size is not None:
+            train_target = train_size // 2 // n_sources
+        else:
+            train_target = min(len(v) for v in source_train.values())
 
-        print(f"\n{class_name} sources (target: {train_target} train clips, {val_target} val clips per source):")
+        if val_size is not None:
+            val_target = val_size // 2 // n_sources
+        else:
+            val_target = max(1, round(train_target * val_split / (1 - val_split)))
+
+        print(f"\n{class_name} sources (target: {train_target} train, {val_target} val per source):")
+
+        # ── First pass: expand each source to target ──────────────────────────
+        source_t_clips = {}
+        source_v_clips = {}
+        total_train_deficit = 0
+        total_val_deficit = 0
 
         for key in class_groups:
             _, source = key
-            t_clips = _expand_source_to_target(source_train[key], train_target, num_frames)
-            v_clips = _expand_source_to_target(source_val[key], val_target, num_frames)
-            train_files.extend(t_clips)
-            val_files.extend(v_clips)
+            t_clips, t_def = _expand_source_to_target(
+                source_train[key], train_target, num_frames, min_seg_frames, max_seg_frames)
+            v_clips, v_def = _expand_source_to_target(
+                source_val[key], val_target, num_frames, min_seg_frames, max_seg_frames)
+            source_t_clips[key] = t_clips
+            source_v_clips[key] = v_clips
+            total_train_deficit += t_def
+            total_val_deficit   += v_def
             print(f"  {source:<15} train: {len(source_train[key])} vids → {len(t_clips)} clips | "
                   f"val: {len(source_val[key])} vids → {len(v_clips)} clips")
 
-    # Balance real vs fake totals
-    for split_name, files_list in [("train", train_files), ("val", val_files)]:
-        real_part = [f for f in files_list if f[1] is True]
-        fake_part = [f for f in files_list if f[1] is False]
-        min_count = min(len(real_part), len(fake_part))
-        balanced = random.sample(real_part, min_count) + random.sample(fake_part, min_count)
-        if split_name == "train":
-            train_files = balanced
-        else:
-            val_files = balanced
+        # ── Second pass: redistribute deficit to surplus sources ──────────────
+        for split_name, deficit, source_clips_dict, source_vids_dict in [
+            ("train", total_train_deficit, source_t_clips, source_train),
+            ("val",   total_val_deficit,   source_v_clips, source_val),
+        ]:
+            if deficit <= 0:
+                continue
+
+            target = train_target if split_name == "train" else val_target
+            # Sources that reached their target can provide more
+            surplus_keys = [k for k in class_groups if len(source_clips_dict[k]) >= target]
+            if not surplus_keys:
+                print(f"  [balance] {class_name} {split_name}: total deficit {deficit} "
+                      f"— no surplus sources to fill it")
+                continue
+
+            extra_per = (deficit + len(surplus_keys) - 1) // len(surplus_keys)
+            print(f"  → Redistributing {deficit} deficit clips across "
+                  f"{len(surplus_keys)} surplus sources (+{extra_per} each)")
+
+            for key in surplus_keys:
+                if deficit <= 0:
+                    break
+                _, source = key
+                new_target = target + min(extra_per, deficit)
+                new_clips, _ = _expand_source_to_target(
+                    source_vids_dict[key], new_target, num_frames, min_seg_frames, max_seg_frames)
+                gained = len(new_clips) - len(source_clips_dict[key])
+                source_clips_dict[key] = new_clips
+                deficit -= gained
+                print(f"  {source:<15} boosted → {len(new_clips)} clips")
+
+        for key in class_groups:
+            train_files.extend(source_t_clips[key])
+            val_files.extend(source_v_clips[key])
 
     return train_files, val_files
