@@ -176,7 +176,8 @@ def _log_wandb_eval(wandb, probs, labels, preds_05, val_files,
 # ── Main evaluate ─────────────────────────────────────────────────────────────
 
 def evaluate(classifier, feature_extractor, val_loader, val_files,
-             device=None, use_wandb=False):
+             device=None, use_wandb=False, wandb_run_id=None,
+             wandb_project="david-deepfake"):
     """
     Full evaluation pipeline.
 
@@ -252,12 +253,21 @@ def evaluate(classifier, feature_extractor, val_loader, val_files,
     # ── W&B logging ───────────────────────────────────────────────────────────
     if use_wandb:
         import wandb
+        _wandb_init = False
+        if wandb.run is None:
+            if wandb_run_id is not None:
+                wandb.init(id=wandb_run_id, resume="must")
+            else:
+                wandb.init(project=wandb_project)
+            _wandb_init = True
         print("\nLogging evaluation artifacts to W&B...")
         _log_wandb_eval(
             wandb, probs, labels, preds_05, val_files,
             per_source, best_threshold,
         )
         print("Done.")
+        if _wandb_init:
+            wandb.finish()
 
     return {
         "auc":               auc,

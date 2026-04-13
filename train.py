@@ -339,11 +339,13 @@ def run_training(
         wandb.run.summary["time/total_wall_secs"] = total_wall_secs
         wandb.run.summary["time/total_wall_mins"] = round(total_wall_secs / 60, 2)
 
+    wandb_run_id = None
     if use_wandb:
         artifact = wandb.Artifact("detector-model", type="model",
                                   description="Best checkpoint by val accuracy")
         artifact.add_file(save_path)
         wandb.log_artifact(artifact)
-        wandb.finish()
+        wandb_run_id = wandb.run.id
+        # Keep run open — evaluate() will log to the same run, then finish
 
-    return classifier
+    return classifier, wandb_run_id
