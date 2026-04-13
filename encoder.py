@@ -139,9 +139,7 @@ def load_feature_extractor(
     model_path = clip._download(url)
 
     try:
-        jit_model = torch.jit.load(
-            model_path, map_location="cpu", weights_only=False
-        ).eval()
+        jit_model = torch.jit.load(model_path, map_location="cpu").eval()
         state_dict = jit_model.state_dict()
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
