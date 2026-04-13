@@ -40,6 +40,57 @@ def _extract_features(feature_extractor, videos, device):
     return image_features.mean(dim=1)
 
 
+def _dataset_stats_table(wandb, train_files, val_files):
+    """Log a per-source dataset breakdown table to W&B."""
+    from collections import defaultdict
+
+    table = wandb.Table(columns=[
+        "split", "source", "class",
+        "n_videos", "n_clips", "n_split_clips", "pct_of_class",
+    ])
+
+    summary = {"train": {"real": 0, "fake": 0}, "val": {"real": 0, "fake": 0}}
+
+    for split_name, files in [("train", train_files), ("val", val_files)]:
+        # Group by (source, class)
+        groups = defaultdict(lambda: {"paths": set(), "clips": 0, "split_clips": 0})
+        for entry in files:
+            src   = entry[2] if len(entry) > 2 else "unknown"
+            label = "real" if entry[1] else "fake"
+            key   = (src, label)
+            groups[key]["paths"].add(entry[0])
+            groups[key]["clips"] += 1
+            if len(entry) == 5:
+                groups[key]["split_clips"] += 1
+
+        # Count totals per class for percentage calculation
+        class_totals = defaultdict(int)
+        for (src, label), stats in groups.items():
+            class_totals[label] += stats["clips"]
+
+        for (src, label), stats in sorted(groups.items()):
+            n_clips  = stats["clips"]
+            pct      = n_clips / class_totals[label] * 100 if class_totals[label] else 0
+            table.add_data(
+                split_name, src, label,
+                len(stats["paths"]),
+                n_clips,
+                stats["split_clips"],
+                round(pct, 1),
+            )
+            summary[split_name][label] += n_clips
+
+    wandb.log({"dataset/source_breakdown": table})
+
+    # Also log scalar summaries
+    wandb.log({
+        "dataset/train_real":  summary["train"]["real"],
+        "dataset/train_fake":  summary["train"]["fake"],
+        "dataset/val_real":    summary["val"]["real"],
+        "dataset/val_fake":    summary["val"]["fake"],
+    })
+
+
 def _build_scheduler(optimizer, scheduler_type, num_epochs, val_loader_len):
     """Instantiate a LR scheduler by name. Returns None if scheduler_type is None."""
     if scheduler_type == "cosine":
@@ -177,6 +228,11 @@ def run_training(
         if wandb_extra_config:
             run_config.update(wandb_extra_config)
         wandb.init(project=wandb_project, name=wandb_run_name, config=run_config)
+        _dataset_stats_table(
+            wandb,
+            train_loader.dataset.video_files,
+            val_loader.dataset.video_files,
+        )
 
     print(f"Creating classification head: {head_type!r}")
     classifier = build_head(head_type=head_type, input_dim=input_dim, num_classes=num_classes)
