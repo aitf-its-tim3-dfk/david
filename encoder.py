@@ -48,7 +48,10 @@ class TextEncoder(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        x = (
+            x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)]
+            @ self.text_projection
+        )
         return x
 
 
@@ -67,7 +70,9 @@ class ViFiCLIP(nn.Module):
         dtype = clip_model.dtype
 
         # Build simple text embeddings (no prompt learning)
-        prompts = [ctx_init.replace("_", " ") + " " + name + "." for name in class_names]
+        prompts = [
+            ctx_init.replace("_", " ") + " " + name + "." for name in class_names
+        ]
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
@@ -134,10 +139,12 @@ def load_feature_extractor(
     model_path = clip._download(url)
 
     try:
-        jit_model = torch.jit.load(model_path, map_location="cpu").eval()
+        jit_model = torch.jit.load(
+            model_path, map_location="cpu", weights_only=False
+        ).eval()
         state_dict = jit_model.state_dict()
     except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
 
     clip_model = clip.build_model(state_dict, design_details)
 
@@ -147,7 +154,7 @@ def load_feature_extractor(
     # 3. Optionally load finetuned weights
     if checkpoint_path is not None:
         logger.info(f"Loading finetuned weights from: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         # Handle both raw state_dicts and checkpoints with a 'state_dict' key
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             ckpt = ckpt["state_dict"]

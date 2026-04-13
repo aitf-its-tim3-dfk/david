@@ -39,7 +39,16 @@ def _extract_features(feature_extractor, videos, device):
     return image_features.mean(dim=1)
 
 
-def train_one_epoch(classifier, feature_extractor, train_loader, criterion, optimizer, device, epoch, num_epochs):
+def train_one_epoch(
+    classifier,
+    feature_extractor,
+    train_loader,
+    criterion,
+    optimizer,
+    device,
+    epoch,
+    num_epochs,
+):
     """Runs a single training epoch."""
     classifier.train()
     running_loss = 0.0
@@ -62,7 +71,15 @@ def train_one_epoch(classifier, feature_extractor, train_loader, criterion, opti
     return avg_loss
 
 
-def validate(classifier, feature_extractor, val_loader, criterion, device, epoch=None, num_epochs=None):
+def validate(
+    classifier,
+    feature_extractor,
+    val_loader,
+    criterion,
+    device,
+    epoch=None,
+    num_epochs=None,
+):
     """Runs validation and returns loss, accuracy, predictions, and labels."""
     classifier.eval()
     val_loss = 0.0
@@ -117,12 +134,23 @@ def run_training(
 
     for epoch in range(num_epochs):
         train_one_epoch(
-            classifier, feature_extractor, train_loader,
-            criterion, optimizer, device, epoch, num_epochs,
+            classifier,
+            feature_extractor,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            epoch,
+            num_epochs,
         )
         _, val_accuracy, _, _ = validate(
-            classifier, feature_extractor, val_loader,
-            criterion, device, epoch, num_epochs,
+            classifier,
+            feature_extractor,
+            val_loader,
+            criterion,
+            device,
+            epoch,
+            num_epochs,
         )
 
         if val_accuracy > best_val_accuracy:
@@ -133,10 +161,14 @@ def run_training(
     # --- Final report with the best checkpoint ---
     print("\n--- Training Complete ---")
     print(f"Loading best model from {save_path} for final report...")
-    classifier.load_state_dict(torch.load(save_path))
+    classifier.load_state_dict(torch.load(save_path, weights_only=False))
 
     _, _, all_preds, all_labels = validate(
-        classifier, feature_extractor, val_loader, criterion, device,
+        classifier,
+        feature_extractor,
+        val_loader,
+        criterion,
+        device,
     )
 
     print("\n--- Final Performance Report (on validation set) ---")
