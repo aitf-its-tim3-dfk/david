@@ -211,5 +211,6 @@ _vificlip_ref/
 _notebook_ref.ipynb
 
 .claude
+GEMINI.md
 paper/paper.typ
 .agents/skills/wandb-primary
