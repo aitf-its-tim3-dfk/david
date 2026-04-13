@@ -13,28 +13,70 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2 as transforms
 from decord import VideoReader, cpu
 
-def load_from_csv(csv_path, base_dir):
+def _is_valid_video(path):
+    """Return True if DECORD can open the file, has frames, and can read one."""
+    try:
+        vr = VideoReader(path, ctx=cpu(0))
+        if len(vr) < 1:
+            return False
+        vr.get_batch([0])  # actually decode a frame to catch corrupt files
+        del vr
+        return True
+    except Exception:
+        return False
+
+
+def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
     """
     Load video file list from a metadata CSV.
 
     Expects columns: 'path' (relative to base_dir), 'class' ('real'/'fake'),
     and 'label' (source name e.g. 'coin', 'SVD').
     Returns a list of (abs_path, label_bool, source_str) tuples.
+
+    Parameters
+    ----------
+    validate : bool
+        If True, open each video with DECORD and drop unreadable files.
+        Slower at load time but prevents broken files from entering training.
+    clean_csv_path : str, optional
+        If set, save the validated file list as a new CSV to this path.
+        Only meaningful when validate=True.
     """
     video_files = []
+    skipped = 0
     with open(csv_path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            abs_path = os.path.join(base_dir, row["path"])
-            label = row["class"].strip().lower() == "real"
-            source = row.get("label", "unknown").strip()
-            video_files.append((abs_path, label, source))
-    print(f"Loaded {len(video_files)} videos from {csv_path}")
+        rows = list(csv.DictReader(f))
+
+    from tqdm import tqdm
+    desc = "Validating videos" if validate else "Loading CSV"
+    for row in tqdm(rows, desc=desc):
+        abs_path = os.path.join(base_dir, row["path"])
+        label = row["class"].strip().lower() == "real"
+        source = row.get("label", "unknown").strip()
+        if validate and not _is_valid_video(abs_path):
+            skipped += 1
+            continue
+        video_files.append((abs_path, label, source))
+
+    print(f"Loaded {len(video_files)} videos from {csv_path}" +
+          (f" ({skipped} broken files skipped)" if skipped else ""))
+
+    if clean_csv_path and validate:
+        with open(clean_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["path", "class", "label"])
+            for abs_path, label, source in video_files:
+                rel_path = os.path.relpath(abs_path, base_dir)
+                writer.writerow([rel_path, "real" if label else "fake", source])
+        print(f"Clean CSV saved: {clean_csv_path}")
+
     return video_files
 
 
-MAX_RETRIES = 15
-RETRY_BASE_DELAY = 1  # seconds
+MAX_RETRIES = 2
+RETRY_BASE_DELAY = 0.5  # seconds
+_broken_files: set = set()  # module-level blacklist — skip known-bad files immediately
 
 
 class OptimizedVideoDataset(Dataset):
@@ -130,7 +172,10 @@ class OptimizedVideoDataset(Dataset):
         return len(self.video_files)
 
     def __getitem__(self, idx):
-        video_path, label = self.video_files[idx]
+        video_path, label, _ = self.video_files[idx]
+
+        if video_path in _broken_files:
+            return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -171,6 +216,7 @@ class OptimizedVideoDataset(Dataset):
                         )
                     else:
                         print(f"[SKIP] Broken sample {video_path}: {e}")
+                    _broken_files.add(video_path)
                     return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
 
 
@@ -187,6 +233,8 @@ def get_train_val_loaders(
     batch_size=16,
     num_workers=2,
     cache_path="video_train_10000_cache_fixed_2.json",
+    validate=False,
+    clean_csv_path=None,
 ):
     """Creates stratified train and validation dataloaders.
 
@@ -202,7 +250,7 @@ def get_train_val_loaders(
         from the remainder. Either can be None (= use all available).
     """
     if csv_path is not None:
-        master_list = load_from_csv(csv_path, base_dir)
+        master_list = load_from_csv(csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path)
     else:
         if not os.path.exists(cache_path):
             print(f"Cache file not found at {cache_path}. Building it now...")

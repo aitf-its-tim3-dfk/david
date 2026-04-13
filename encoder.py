@@ -137,7 +137,7 @@ def load_feature_extractor(
         jit_model = torch.jit.load(model_path, map_location="cpu").eval()
         state_dict = jit_model.state_dict()
     except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
 
     clip_model = clip.build_model(state_dict, design_details)
 
@@ -147,10 +147,18 @@ def load_feature_extractor(
     # 3. Optionally load finetuned weights
     if checkpoint_path is not None:
         logger.info(f"Loading finetuned weights from: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
-        # Handle both raw state_dicts and checkpoints with a 'state_dict' key
-        if isinstance(ckpt, dict) and "state_dict" in ckpt:
-            ckpt = ckpt["state_dict"]
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        # Unwrap training checkpoints — try common key names
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
+            elif "model" in ckpt:
+                ckpt = ckpt["model"]
+        # Strip 'module.' prefix from DDP-saved checkpoints
+        if any(k.startswith("module.") for k in ckpt.keys()):
+            from collections import OrderedDict
+            ckpt = OrderedDict((k.replace("module.", "", 1), v) for k, v in ckpt.items())
+
         missing, unexpected = model.load_state_dict(ckpt, strict=False)
         if missing:
             logger.warning(f"Missing keys: {missing}")
