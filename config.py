@@ -45,7 +45,7 @@ _DEFAULTS = {
         "val_split":   0.2,
         "train_size":  None,
         "val_size":    None,
-        "balance":     False,
+        "balance":     True,
     },
 }
 

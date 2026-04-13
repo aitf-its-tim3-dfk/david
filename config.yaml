@@ -56,7 +56,7 @@ dataset:
   val_split: 0.2           # used when train_size and val_size are both null
   train_size: null         # e.g. 15000 — null means use all remaining after val
   val_size: null           # e.g. 200   — null means use val_split ratio
-  balance: false           # true = equal clips per source within each class (no leakage)
+  balance: true            # true = equal clips per source within each class (no leakage)
 
 wandb:
   enabled: true            # set false to disable W&B logging
