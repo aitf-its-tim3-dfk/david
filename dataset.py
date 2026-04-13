@@ -48,10 +48,15 @@ def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
     with open(csv_path, "r") as f:
         rows = list(csv.DictReader(f))
 
+    VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
     from tqdm import tqdm
     desc = "Validating videos" if validate else "Loading CSV"
     for row in tqdm(rows, desc=desc):
         abs_path = os.path.join(base_dir, row["path"])
+        if os.path.splitext(abs_path)[1].lower() not in VIDEO_EXTENSIONS:
+            skipped += 1
+            continue
         label = row["class"].strip().lower() == "real"
         source = row.get("label", "unknown").strip()
         if validate and not _is_valid_video(abs_path):
@@ -250,7 +255,12 @@ def get_train_val_loaders(
         from the remainder. Either can be None (= use all available).
     """
     if csv_path is not None:
-        master_list = load_from_csv(csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path)
+        # If clean CSV already exists, load it directly (skip re-validation)
+        if clean_csv_path and os.path.exists(clean_csv_path):
+            print(f"Clean CSV found, loading from: {clean_csv_path}")
+            master_list = load_from_csv(clean_csv_path, base_dir)
+        else:
+            master_list = load_from_csv(csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path)
     else:
         if not os.path.exists(cache_path):
             print(f"Cache file not found at {cache_path}. Building it now...")
