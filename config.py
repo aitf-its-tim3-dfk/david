@@ -1,7 +1,7 @@
 """
 Paths and hyperparameters for the deepfake video detector.
 
-All Colab/Google Drive paths are kept here so the rest of the codebase
+All environment-specific paths are kept here so the rest of the codebase
 stays environment-agnostic.
 """
 
@@ -10,30 +10,12 @@ import os
 # ──────────────────────────────────────────────
 # Paths
 # ──────────────────────────────────────────────
-CACHE_PATH = "video_train_10000_cache_fixed_2.json"
+DATASET_ROOT = "/root/.cache/kagglehub/datasets/farhanwew/real-vs-gen-videos/versions/4"
+METADATA_CSV = os.path.join(DATASET_ROOT, "metadata_clean_v2.csv")
 BEST_MODEL_SAVE_PATH = "best_detector_model.pt"
 
 # Where the finetuned ViFi-CLIP checkpoint lives (set to None to use base CLIP)
 VIFICLIP_CHECKPOINT = None  # or e.g. "/content/drive/MyDrive/vifi_clip_30_epochs_k400_full_finetuned.pth"
-
-DRIVE_CACHE_PATH = (
-    "/content/drive/MyDrive/data mining gemastik/"
-    "video train 10000/video_train_10000_cache_fixed_2.json"
-)
-
-BASE_DIR = "/content/drive/MyDrive/data mining gemastik"
-
-REAL_VIDEO_PATHS = [
-    "/content/drive/.shortcut-targets-by-id/"
-    "1Wcbv564DV62urzCJvYmvnkDD_Z74ZKLa/GenVideo-Val/Real",
-    os.path.join(BASE_DIR, "K4/videos_val"),
-]
-
-FAKE_VIDEO_PATHS = [
-    "/content/drive/MyDrive/gemastik-datmin/pika/train_pika",
-    os.path.join(BASE_DIR, "Sora/train_OpenSora"),
-    os.path.join(BASE_DIR, "SVD/train_SVD"),
-]
 
 # ──────────────────────────────────────────────
 # Model

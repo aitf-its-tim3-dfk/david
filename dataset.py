@@ -3,10 +3,10 @@ Video dataset and dataloader utilities for deepfake detection.
 """
 
 import os
-import json
-import time
 import random
+import time
 
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2 as transforms
@@ -21,19 +21,17 @@ class OptimizedVideoDataset(Dataset):
     Custom PyTorch Dataset for loading videos.
 
     Can be initialized in two ways:
-      1. By providing `real_video_dirs` and `fake_video_dirs` to scan.
-      2. By providing a pre-made `file_list`.
+      1. By providing `dataset_root` and `metadata_csv` to load from a CSV.
+      2. By providing a pre-made `file_list` of (path, label) tuples.
     """
 
     def __init__(
         self,
-        real_video_dirs=None,
-        fake_video_dirs=None,
+        dataset_root=None,
+        metadata_csv=None,
         file_list=None,
         transform=None,
         num_frames=16,
-        max_files_per_folder=1000,
-        cache_path="video_dataset_cache.json",
     ):
         super().__init__()
         self.transform = transform
@@ -41,68 +39,26 @@ class OptimizedVideoDataset(Dataset):
 
         if file_list is not None:
             self.video_files = file_list
+        elif dataset_root is not None and metadata_csv is not None:
+            self.video_files = self._load_from_csv(dataset_root, metadata_csv)
         else:
-            self.video_files = self._get_video_files(
-                real_video_dirs, fake_video_dirs, max_files_per_folder, cache_path
+            raise ValueError(
+                "Provide either (dataset_root + metadata_csv) or file_list."
             )
 
-    def _get_video_files(self, real_dirs, fake_dirs, max_per_dir, cache_path):
-        """Scans directories (or loads from cache) to create a list of video paths and labels."""
-        if os.path.exists(cache_path):
-            print(f"Loading cached file list from: {cache_path}")
-            with open(cache_path, "r") as f:
-                video_list = json.load(f)
-            print(f"Found {len(video_list)} videos in cache.")
-            return video_list
+    @staticmethod
+    def _load_from_csv(dataset_root, metadata_csv):
+        """Loads the video file list from a metadata CSV."""
+        print(f"Loading metadata from: {metadata_csv}")
+        df = pd.read_csv(metadata_csv)
 
-        print("No cache found. Scanning directories to create a new file list...")
         video_list = []
+        for _, row in df.iterrows():
+            full_path = os.path.join(dataset_root, row["path"])
+            is_real = row["class"] == "real"
+            video_list.append((full_path, is_real))
 
-        def scan_dirs(directories, label):
-            for dir_path in directories:
-                if not os.path.isdir(dir_path):
-                    print(f"Warning: Directory not found, skipping: {dir_path}")
-                    continue
-                print(f"Scanning {dir_path}...")
-                count = 0
-                skipped = 0
-                try:
-                    with os.scandir(dir_path) as it:
-                        for entry in it:
-                            if max_per_dir is not None and count >= max_per_dir:
-                                print(f"  -> Reached limit of {max_per_dir} files.")
-                                break
-                            if entry.is_file() and entry.name.lower().endswith(
-                                (".mp4", ".avi", ".mov", ".mkv")
-                            ):
-                                # check if the video is actually readable
-                                try:
-                                    vr = VideoReader(entry.path, ctx=cpu(0))
-                                    if len(vr) < 1:
-                                        raise ValueError("0 frames")
-                                    del vr
-                                except Exception as e:
-                                    skipped += 1
-                                    print(f"  Skipping invalid video: {entry.name} ({e})")
-                                    continue
-                                video_list.append((entry.path, label))
-                                count += 1
-                except FileNotFoundError:
-                    print(f"Warning: Directory scan failed for: {dir_path}")
-                if skipped > 0:
-                    print(f"  Skipped {skipped} invalid videos in {dir_path}.")
-
-        scan_dirs(real_dirs, True)
-        scan_dirs(fake_dirs, False)
-
-        try:
-            with open(cache_path, "w") as f:
-                json.dump(video_list, f, indent=4)
-            print(f"Saved file list cache to: {cache_path}")
-        except Exception as e:
-            print(f"Error saving cache file: {e}")
-
-        print(f"Found {len(video_list)} videos in total.")
+        print(f"Loaded {len(video_list)} videos from CSV.")
         return video_list
 
     def __len__(self):
@@ -155,30 +111,17 @@ class OptimizedVideoDataset(Dataset):
 
 def get_train_val_loaders(
     transform,
-    real_dirs=None,
-    fake_dirs=None,
-    max_per_dir=None,
+    dataset_root,
+    metadata_csv,
     val_split=0.2,
     batch_size=16,
     num_workers=2,
-    cache_path="video_train_10000_cache_fixed_2.json",
 ):
-    """Creates stratified train and validation dataloaders from a cache file."""
-    if not os.path.exists(cache_path):
-        print(f"Cache file not found at {cache_path}. Building it now...")
-        OptimizedVideoDataset(
-            real_video_dirs=real_dirs,
-            fake_video_dirs=fake_dirs,
-            max_files_per_folder=max_per_dir,
-            cache_path=cache_path,
-        )
+    """Creates stratified train and validation dataloaders from a metadata CSV."""
+    all_files = OptimizedVideoDataset._load_from_csv(dataset_root, metadata_csv)
 
-    print(f"Loading and splitting file list from {cache_path}...")
-    with open(cache_path, "r") as f:
-        master_list = json.load(f)
-
-    real_videos = [item for item in master_list if item[1] is True]
-    fake_videos = [item for item in master_list if item[1] is False]
+    real_videos = [item for item in all_files if item[1] is True]
+    fake_videos = [item for item in all_files if item[1] is False]
     random.shuffle(real_videos)
     random.shuffle(fake_videos)
 
