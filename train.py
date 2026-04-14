@@ -1,5 +1,9 @@
 """
 Training and evaluation loop for the deepfake video detector.
+
+Supports both video (multi-frame) and image (single-frame) inputs through
+a unified feature extraction path. Uses CrossEntropyLoss for both binary
+and multi-class detection.
 """
 
 import random
@@ -26,17 +30,26 @@ def set_seed(seed_value=42):
         torch.backends.cudnn.benchmark = False
 
 
-def _extract_features(feature_extractor, videos, device):
-    """Runs videos through the frozen ViFi-CLIP image encoder and mean-pools over frames."""
-    videos = videos.to(device)
-    batch_size, num_frames, C, H, W = videos.shape
-    videos = videos.reshape(batch_size * num_frames, C, H, W)
+def _extract_features(feature_extractor, inputs, device):
+    """
+    Runs inputs through the frozen ViFi-CLIP image encoder.
+
+    Handles both video (B, T, C, H, W) and image (B, 1, C, H, W) inputs.
+    Features are mean-pooled over the temporal dimension (identity for T=1).
+    """
+    inputs = inputs.to(device)
 
     with torch.no_grad():
-        image_features = feature_extractor.image_encoder(videos)
-
-    image_features = image_features.view(batch_size, num_frames, -1)
-    return image_features.mean(dim=1)
+        if inputs.dim() == 5:  # (B, T, C, H, W) — video or image with temporal dim
+            B, T, C, H, W = inputs.shape
+            feats = feature_extractor.image_encoder(
+                inputs.reshape(B * T, C, H, W)
+            )
+            return feats.view(B, T, -1).mean(dim=1)
+        elif inputs.dim() == 4:  # (B, C, H, W) — image without temporal dim
+            return feature_extractor.image_encoder(inputs)
+        else:
+            raise ValueError(f"Unexpected input dimensions: {inputs.dim()}")
 
 
 def train_one_epoch(
@@ -54,11 +67,11 @@ def train_one_epoch(
     running_loss = 0.0
     print(f"\n--- Epoch {epoch + 1}/{num_epochs} | Training ---")
 
-    for _, (videos, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
-        labels = labels.to(device).float().unsqueeze(1)
-        video_feature = _extract_features(feature_extractor, videos, device)
+    for _, (inputs, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
+        labels = labels.to(device).long()
+        features = _extract_features(feature_extractor, inputs, device)
 
-        outputs = classifier(video_feature)
+        outputs = classifier(features)
         loss = criterion(outputs, labels)
 
         optimizer.zero_grad()
@@ -90,14 +103,14 @@ def validate(
         print(f"--- Epoch {epoch + 1}/{num_epochs} | Validation ---")
 
     with torch.no_grad():
-        for videos, labels in tqdm(val_loader, total=len(val_loader)):
-            labels = labels.to(device).float().unsqueeze(1)
-            video_feature = _extract_features(feature_extractor, videos, device)
+        for inputs, labels in tqdm(val_loader, total=len(val_loader)):
+            labels = labels.to(device).long()
+            features = _extract_features(feature_extractor, inputs, device)
 
-            outputs = classifier(video_feature)
+            outputs = classifier(features)
             val_loss += criterion(outputs, labels).item()
 
-            preds = torch.sigmoid(outputs) > 0.5
+            preds = outputs.argmax(dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
@@ -114,7 +127,8 @@ def run_training(
     train_loader,
     val_loader,
     input_dim=512,
-    num_classes=1,
+    num_classes=2,
+    class_names=("real", "fake"),
     lr=1e-3,
     num_epochs=5,
     save_path="best_detector_model.pt",
@@ -123,11 +137,11 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    print("Creating new classification head...")
+    print(f"Creating classification head ({num_classes} classes)...")
     classifier = ClassificationHead(input_dim=input_dim, num_classes=num_classes)
     classifier.to(device)
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(classifier.parameters(), lr=lr)
 
     best_val_accuracy = 0.0
@@ -172,7 +186,7 @@ def run_training(
     )
 
     print("\n--- Final Performance Report (on validation set) ---")
-    target_names = ["Fake (0)", "Real (1)"]
+    target_names = list(class_names)
     print(classification_report(all_labels, all_preds, target_names=target_names))
 
     return classifier
