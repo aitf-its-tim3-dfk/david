@@ -181,7 +181,7 @@ def _stratified_source_split(file_list, val_split=0.2):
         split_idx = int(len(items) * (1 - val_split))
         train_files.extend(items[:split_idx])
         val_files.extend(items[split_idx:])
-        label_str = "real" if label else "fake"
+        label_str = f"label={label}"
         print(
             f"  {label_str}/{source:15s}  "
             f"total={len(items):5d}  train={split_idx:5d}  val={len(items) - split_idx:5d}"
