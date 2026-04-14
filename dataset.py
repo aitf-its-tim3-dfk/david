@@ -11,7 +11,7 @@ from collections import defaultdict
 
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torchvision.transforms import v2 as transforms
 from decord import VideoReader, cpu
 
@@ -192,6 +192,28 @@ def _stratified_source_split(file_list, val_split=0.2):
     return train_files, val_files
 
 
+def temporal_pad_collate(batch):
+    """
+    Custom collate that pads the temporal dimension to the max T in the batch.
+
+    Handles mixed frame counts (e.g. video with T=16 and images with T=1)
+    by repeating the last frame to match the longest sample.
+    """
+    tensors, labels = zip(*batch)
+    max_t = max(t.shape[0] for t in tensors)
+
+    padded = []
+    for t in tensors:
+        if t.shape[0] < max_t:
+            # Repeat last frame to pad
+            pad_count = max_t - t.shape[0]
+            padding = t[-1:].expand(pad_count, -1, -1, -1)
+            t = torch.cat([t, padding], dim=0)
+        padded.append(t)
+
+    return torch.stack(padded), torch.tensor(labels, dtype=torch.long)
+
+
 def get_train_val_loaders(
     train_transform,
     val_transform,
@@ -222,10 +244,97 @@ def get_train_val_loaders(
     )
 
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, collate_fn=temporal_pad_collate,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, collate_fn=temporal_pad_collate,
     )
 
     return train_loader, val_loader
+
+
+def get_combined_loaders(
+    train_transform,
+    val_transform,
+    video_dataset_root=None,
+    video_metadata_csv=None,
+    cddb_root=None,
+    cddb_subdatasets=None,
+    cddb_label_offset=1,
+    val_split=0.2,
+    batch_size=16,
+    num_workers=2,
+    num_frames=16,
+    sampling_weights=(0.6, 0.25, 0.15),
+):
+    """
+    Creates combined train/val loaders that can mix video and image datasets.
+
+    Uses ConcatDataset + temporal_pad_collate so video frames (T=16) and
+    single images (T=1) can coexist in the same batch — the encoder's
+    mean pool handles the rest.
+    """
+    from dataset_cddb import CDDBDataset
+
+    train_datasets = []
+    val_datasets = []
+
+    # Video dataset
+    if video_dataset_root and video_metadata_csv:
+        all_files = OptimizedVideoDataset._load_from_csv(
+            video_dataset_root, video_metadata_csv
+        )
+        train_files, val_files = _stratified_source_split(all_files, val_split)
+
+        train_datasets.append(OptimizedVideoDataset(
+            file_list=train_files,
+            transform=train_transform,
+            num_frames=num_frames,
+            sampling_weights=sampling_weights,
+            is_train=True,
+        ))
+        val_datasets.append(OptimizedVideoDataset(
+            file_list=val_files,
+            transform=val_transform,
+            num_frames=num_frames,
+            is_train=False,
+        ))
+
+    # CDDB image dataset
+    if cddb_root:
+        train_datasets.append(CDDBDataset(
+            root=cddb_root,
+            subdatasets=cddb_subdatasets,
+            split="train",
+            transform=train_transform,
+            label_offset=cddb_label_offset,
+        ))
+        val_datasets.append(CDDBDataset(
+            root=cddb_root,
+            subdatasets=cddb_subdatasets,
+            split="val",
+            transform=val_transform,
+            label_offset=cddb_label_offset,
+        ))
+
+    if not train_datasets:
+        raise ValueError("No datasets provided. Specify video and/or CDDB paths.")
+
+    train_combined = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    val_combined = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
+
+    print(f"\nCombined dataset: {len(train_combined)} train, {len(val_combined)} val")
+
+    train_loader = DataLoader(
+        train_combined, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, collate_fn=temporal_pad_collate,
+    )
+    val_loader = DataLoader(
+        val_combined, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, collate_fn=temporal_pad_collate,
+    )
+
+    return train_loader, val_loader
+
