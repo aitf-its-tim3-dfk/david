@@ -48,6 +48,8 @@ class OptimizedVideoDataset(Dataset):
         num_frames=16,
         sampling_weights=(0.6, 0.25, 0.15),
         is_train=True,
+        real_label=0,
+        fake_label=1,
     ):
         super().__init__()
         self.transform = transform
@@ -58,14 +60,17 @@ class OptimizedVideoDataset(Dataset):
         if file_list is not None:
             self.video_files = file_list
         elif dataset_root is not None and metadata_csv is not None:
-            self.video_files = self._load_from_csv(dataset_root, metadata_csv)
+            self.video_files = self._load_from_csv(
+                dataset_root, metadata_csv,
+                real_label=real_label, fake_label=fake_label,
+            )
         else:
             raise ValueError(
                 "Provide either (dataset_root + metadata_csv) or file_list."
             )
 
     @staticmethod
-    def _load_from_csv(dataset_root, metadata_csv):
+    def _load_from_csv(dataset_root, metadata_csv, real_label=0, fake_label=1):
         """Loads the video file list from a metadata CSV as (path, label, source) tuples."""
         print(f"Loading metadata from: {metadata_csv}")
         df = pd.read_csv(metadata_csv)
@@ -73,11 +78,11 @@ class OptimizedVideoDataset(Dataset):
         video_list = []
         for _, row in df.iterrows():
             full_path = os.path.join(dataset_root, row["path"])
-            is_real = row["class"] == "real"
+            label = real_label if row["class"] == "real" else fake_label
             # Extract source from path: e.g. "fake/Sora/vid.mp4" -> "Sora"
             path_parts = row["path"].replace("\\", "/").split("/")
             source = path_parts[1] if len(path_parts) > 1 else "unknown"
-            video_list.append((full_path, is_real, source))
+            video_list.append((full_path, label, source))
 
         print(f"Loaded {len(video_list)} videos from CSV.")
         return video_list
@@ -130,7 +135,7 @@ class OptimizedVideoDataset(Dataset):
 
                 if self.transform:
                     video_tensor = self.transform(video_tensor)
-                return video_tensor, int(label)
+                return video_tensor, label
 
             except Exception as e:
                 is_retryable = "Error reading" in str(e)
@@ -152,7 +157,7 @@ class OptimizedVideoDataset(Dataset):
                     # Fallback: return a single zero frame if single strategy,
                     # otherwise num_frames zero frames.
                     n = 1 if (self.is_train and strategy == STRATEGY_SINGLE) else self.num_frames
-                    return torch.zeros((n, 3, 224, 224)), int(label)
+                    return torch.zeros((n, 3, 224, 224)), label
 
 
 def _stratified_source_split(file_list, val_split=0.2):
@@ -263,6 +268,8 @@ def get_combined_loaders(
     cddb_root=None,
     cddb_subdatasets=None,
     cddb_label_offset=1,
+    video_real_label=0,
+    video_fake_label=2,
     val_split=0.2,
     batch_size=16,
     num_workers=2,
@@ -284,7 +291,8 @@ def get_combined_loaders(
     # Video dataset
     if video_dataset_root and video_metadata_csv:
         all_files = OptimizedVideoDataset._load_from_csv(
-            video_dataset_root, video_metadata_csv
+            video_dataset_root, video_metadata_csv,
+            real_label=video_real_label, fake_label=video_fake_label,
         )
         train_files, val_files = _stratified_source_split(all_files, val_split)
 
