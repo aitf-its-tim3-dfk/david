@@ -50,14 +50,19 @@ def _dataset_stats_table(wandb, train_files, val_files):
         "n_videos", "n_clips", "n_split_clips", "pct_of_class",
     ])
 
-    summary = {"train": {"real": 0, "fake": 0}, "val": {"real": 0, "fake": 0}}
+    # Collect unique class label values across both splits
+    all_label_vals = sorted(set(
+        entry[1] for files in [train_files, val_files] for entry in files
+    ))
+
+    summary = {split: defaultdict(int) for split in ("train", "val")}
 
     for split_name, files in [("train", train_files), ("val", val_files)]:
-        # Group by (source, class)
+        # Group by (source, class_label)
         groups = defaultdict(lambda: {"paths": set(), "clips": 0, "split_clips": 0})
         for entry in files:
             src   = entry[2] if len(entry) > 2 else "unknown"
-            label = "real" if entry[1] else "fake"
+            label = str(entry[1])
             key   = (src, label)
             groups[key]["paths"].add(entry[0])
             groups[key]["clips"] += 1
@@ -83,13 +88,12 @@ def _dataset_stats_table(wandb, train_files, val_files):
 
     wandb.log({"dataset/source_breakdown": table})
 
-    # Also log scalar summaries
-    wandb.log({
-        "dataset/train_real":  summary["train"]["real"],
-        "dataset/train_fake":  summary["train"]["fake"],
-        "dataset/val_real":    summary["val"]["real"],
-        "dataset/val_fake":    summary["val"]["fake"],
-    })
+    # Log scalar summaries per class
+    scalar_logs = {}
+    for split_name in ("train", "val"):
+        for label, count in summary[split_name].items():
+            scalar_logs[f"dataset/{split_name}_{label}"] = count
+    wandb.log(scalar_logs)
 
 
 def _build_scheduler(optimizer, scheduler_type, num_epochs, val_loader_len):
@@ -104,7 +108,7 @@ def _build_scheduler(optimizer, scheduler_type, num_epochs, val_loader_len):
 def train_one_epoch(
     classifier, feature_extractor, train_loader,
     criterion, optimizer, device, epoch, num_epochs,
-    scaler=None,
+    scaler=None, num_classes=1,
 ):
     """Runs a single training epoch. Uses AMP if scaler is provided."""
     classifier.train()
@@ -118,7 +122,10 @@ def train_one_epoch(
     for _, (videos, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
         batch_start = time.perf_counter()
 
-        labels = labels.to(device).float().unsqueeze(1)
+        if num_classes == 1:
+            labels = labels.to(device).float().unsqueeze(1)
+        else:
+            labels = labels.to(device).long()
         video_feature = _extract_features(feature_extractor, videos, device)
 
         with autocast(device_type=device.type, enabled=use_amp):
@@ -151,7 +158,8 @@ def train_one_epoch(
     return avg_loss, epoch_secs, avg_batch_ms, throughput
 
 
-def validate(classifier, feature_extractor, val_loader, criterion, device, epoch=None, num_epochs=None):
+def validate(classifier, feature_extractor, val_loader, criterion, device,
+             epoch=None, num_epochs=None, num_classes=1):
     """Runs validation and returns loss, accuracy, predictions, and labels."""
     classifier.eval()
     val_loss = 0.0
@@ -163,15 +171,21 @@ def validate(classifier, feature_extractor, val_loader, criterion, device, epoch
 
     with torch.no_grad():
         for videos, labels in tqdm(val_loader, total=len(val_loader)):
-            labels = labels.to(device).float().unsqueeze(1)
+            if num_classes == 1:
+                labels = labels.to(device).float().unsqueeze(1)
+            else:
+                labels = labels.to(device).long()
             video_feature = _extract_features(feature_extractor, videos, device)
 
             outputs = classifier(video_feature)
             val_loss += criterion(outputs, labels).item()
 
-            preds = torch.sigmoid(outputs) > 0.5
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            if num_classes == 1:
+                preds = (torch.sigmoid(outputs) > 0.5).long()
+            else:
+                preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy().flatten())
+            all_labels.extend(labels.cpu().numpy().flatten())
 
     avg_loss = val_loss / len(val_loader)
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
@@ -254,7 +268,10 @@ def run_training(
     classifier = build_head(head_type=head_type, input_dim=input_dim, num_classes=num_classes)
     classifier.to(device)
 
-    criterion = nn.BCEWithLogitsLoss()
+    if num_classes == 1:
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(classifier.parameters(), lr=lr)
     scaler = GradScaler(device=device.type) if use_amp else None
     scheduler = _build_scheduler(optimizer, lr_scheduler, num_epochs, len(val_loader))
@@ -269,13 +286,13 @@ def run_training(
         train_loss, epoch_secs, avg_batch_ms, throughput = train_one_epoch(
             classifier, feature_extractor, train_loader,
             criterion, optimizer, device, epoch, num_epochs,
-            scaler=scaler,
+            scaler=scaler, num_classes=num_classes,
         )
         total_train_secs += epoch_secs
 
         val_loss, val_accuracy, _, _ = validate(
             classifier, feature_extractor, val_loader,
-            criterion, device, epoch, num_epochs,
+            criterion, device, epoch, num_epochs, num_classes=num_classes,
         )
 
         # LR scheduler step
@@ -325,10 +342,18 @@ def run_training(
 
     _, _, all_preds, all_labels = validate(
         classifier, feature_extractor, val_loader, criterion, device,
+        num_classes=num_classes,
     )
 
     print("\n--- Final Performance Report (on validation set) ---")
-    target_names = ["Fake (0)", "Real (1)"]
+    # Build target_names from wandb_extra_config["class_names"] if available
+    class_names = (wandb_extra_config or {}).get("class_names", None)
+    if class_names is not None:
+        target_names = [f"{n} ({i})" for i, n in enumerate(class_names)]
+    elif num_classes == 1:
+        target_names = ["Fake (0)", "Real (1)"]
+    else:
+        target_names = [str(i) for i in range(num_classes)]
     print(classification_report(all_labels, all_preds, target_names=target_names))
 
     # ── W&B artifact + finish ─────────────────────────────────────────────────

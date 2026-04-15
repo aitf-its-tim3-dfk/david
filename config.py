@@ -27,7 +27,7 @@ _DEFAULTS = {
     },
     "model": {
         "clip_arch":    "ViT-B/16",
-        "class_names":  ["true", "false"],
+        "class_names":  ["fake", "real"],  # index 0=fake, 1=real (binary default)
         "head_type":    "deep",
     },
     "training": {
@@ -37,6 +37,8 @@ _DEFAULTS = {
         "num_frames":    16,
         "num_workers":   2,
         "input_dim":     512,
+        # 1 = binary mode (sigmoid + BCEWithLogitsLoss)
+        # >=2 = multiclass mode (softmax + CrossEntropyLoss + argmax)
         "num_classes":   1,
         "use_amp":       True,
         "lr_scheduler":  "cosine",

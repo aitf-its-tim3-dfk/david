@@ -110,22 +110,28 @@ def _expand_source_to_target(videos, target, num_frames, min_seg_frames=150, max
     return clips, deficit
 
 
-def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
+def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None, class_names=None):
     """
     Load video file list from a metadata CSV.
 
-    Expects columns: 'path' (relative to base_dir), 'class' ('real'/'fake'),
+    Expects columns: 'path' (relative to base_dir), 'class' (class name string),
     and 'label' (source name e.g. 'coin', 'SVD').
-    Returns a list of (abs_path, label_bool, source_str) tuples.
+
+    Returns a list of (abs_path, label, source_str) tuples where label is:
+      - bool (True=real, False=fake) when class_names is None  [binary legacy]
+      - int (class index into class_names list) when class_names is provided
 
     Parameters
     ----------
     validate : bool
         If True, open each video with DECORD and drop unreadable files.
-        Slower at load time but prevents broken files from entering training.
     clean_csv_path : str, optional
         If set, save the validated file list as a new CSV to this path.
         Only meaningful when validate=True.
+    class_names : list of str, optional
+        Ordered list of class name strings. Maps CSV 'class' column value to
+        integer index. E.g. ["real", "fake_pika", "fake_sora"] → 0, 1, 2.
+        If None, falls back to binary bool mapping ("real" → True, else → False).
     """
     video_files = []
     skipped = 0
@@ -134,6 +140,10 @@ def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
 
     VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
+    # Build class name → index mapping if provided
+    class_to_idx = {name.strip().lower(): idx for idx, name in enumerate(class_names)} \
+        if class_names is not None else None
+
     from tqdm import tqdm
     desc = "Validating videos" if validate else "Loading CSV"
     for row in tqdm(rows, desc=desc):
@@ -141,7 +151,14 @@ def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
         if os.path.splitext(abs_path)[1].lower() not in VIDEO_EXTENSIONS:
             skipped += 1
             continue
-        label = row["class"].strip().lower() == "real"
+        class_str = row["class"].strip().lower()
+        if class_to_idx is not None:
+            if class_str not in class_to_idx:
+                skipped += 1
+                continue
+            label = class_to_idx[class_str]
+        else:
+            label = class_str == "real"  # binary legacy: bool
         source = row.get("label", "unknown").strip()
         if validate and not _is_valid_video(abs_path):
             skipped += 1
@@ -157,7 +174,12 @@ def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
             writer.writerow(["path", "class", "label"])
             for abs_path, label, source in video_files:
                 rel_path = os.path.relpath(abs_path, base_dir)
-                writer.writerow([rel_path, "real" if label else "fake", source])
+                # Write back as class name string
+                if class_names is not None:
+                    class_str_out = class_names[label]
+                else:
+                    class_str_out = "real" if label else "fake"
+                writer.writerow([rel_path, class_str_out, source])
         print(f"Clean CSV saved: {clean_csv_path}")
 
     return video_files
@@ -344,6 +366,7 @@ def get_train_val_loaders(
     min_seg_secs=5,
     max_seg_secs=10,
     split_cache_path=None,
+    class_names=None,
 ):
     """Creates stratified train and validation dataloaders.
 
@@ -360,10 +383,11 @@ def get_train_val_loaders(
     if csv_path is not None:
         if clean_csv_path and os.path.exists(clean_csv_path):
             print(f"Clean CSV found, loading from: {clean_csv_path}")
-            master_list = load_from_csv(clean_csv_path, base_dir)
+            master_list = load_from_csv(clean_csv_path, base_dir, class_names=class_names)
         else:
             master_list = load_from_csv(
-                csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path
+                csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path,
+                class_names=class_names,
             )
     else:
         if not os.path.exists(cache_path):
@@ -415,32 +439,34 @@ def get_train_val_loaders(
 
     # ── Standard split modes ──────────────────────────────────────────────────
     else:
-        real_videos = [item for item in master_list if item[1] is True]
-        fake_videos = [item for item in master_list if item[1] is False]
-        random.shuffle(real_videos)
-        random.shuffle(fake_videos)
+        unique_labels = sorted(set(item[1] for item in master_list))
+        class_buckets = {lbl: [item for item in master_list if item[1] == lbl]
+                         for lbl in unique_labels}
+        for lbl in unique_labels:
+            random.shuffle(class_buckets[lbl])
+
+        total = len(master_list)
 
         if train_size is not None or val_size is not None:
-            total = len(real_videos) + len(fake_videos)
-            real_ratio = len(real_videos) / total
-            fake_ratio = len(fake_videos) / total
-
-            if val_size is not None:
-                n_val_real = min(round(val_size * real_ratio), len(real_videos))
-                n_val_fake = min(round(val_size * fake_ratio), len(fake_videos))
-            else:
-                n_val_real = int(len(real_videos) * val_split)
-                n_val_fake = int(len(fake_videos) * val_split)
-
-            val_files  = real_videos[:n_val_real] + fake_videos[:n_val_fake]
-            train_pool = real_videos[n_val_real:] + fake_videos[n_val_fake:]
+            val_files  = []
+            train_pool = []
+            for lbl, bucket in class_buckets.items():
+                ratio = len(bucket) / total
+                if val_size is not None:
+                    n_val = min(round(val_size * ratio), len(bucket))
+                else:
+                    n_val = int(len(bucket) * val_split)
+                val_files  += bucket[:n_val]
+                train_pool += bucket[n_val:]
             random.shuffle(train_pool)
             train_files = train_pool[:train_size] if train_size is not None else train_pool
         else:
-            real_split_idx = int(len(real_videos) * (1 - val_split))
-            fake_split_idx = int(len(fake_videos) * (1 - val_split))
-            train_files = real_videos[:real_split_idx] + fake_videos[:fake_split_idx]
-            val_files   = real_videos[real_split_idx:] + fake_videos[fake_split_idx:]
+            train_files = []
+            val_files   = []
+            for lbl, bucket in class_buckets.items():
+                split_idx = int(len(bucket) * (1 - val_split))
+                train_files += bucket[:split_idx]
+                val_files   += bucket[split_idx:]
 
     random.shuffle(train_files)
     random.shuffle(val_files)
@@ -479,8 +505,11 @@ def _balanced_split(master_list, val_split=0.2, num_frames=16,
     """
     Video-level split with per-source balance and optional multi-clip expansion.
 
+    Supports N classes (binary or multiclass). Labels may be bool (binary legacy)
+    or int (multiclass). Each unique label value is treated as one class.
+
     Target per source:
-      - If train_size provided: train_size // 2 // n_sources (equal real & fake halves)
+      - If train_size provided: train_size // n_classes // n_sources
       - Otherwise: min(source video count) across sources in that class
 
     If a source can't reach target (limited by min_seg_frames), its deficit is
@@ -493,16 +522,23 @@ def _balanced_split(master_list, val_split=0.2, num_frames=16,
         key = (item[1], item[2] if len(item) > 2 else "unknown")
         groups[key].append(item)
 
-    real_groups = {k: v for k, v in groups.items() if k[0] is True}
-    fake_groups = {k: v for k, v in groups.items() if k[0] is False}
+    unique_classes = sorted(set(k[0] for k in groups))
+    n_classes = len(unique_classes)
+
+    # Build per-class group dicts: {label_value: {(label, source): [items]}}
+    class_group_map = {
+        cls: {k: v for k, v in groups.items() if k[0] == cls}
+        for cls in unique_classes
+    }
 
     train_files = []
     val_files = []
 
-    for class_name, class_groups in [("Real", real_groups), ("Fake", fake_groups)]:
+    for cls_idx, class_groups in class_group_map.items():
         if not class_groups:
             continue
 
+        class_name = str(cls_idx)
         n_sources = len(class_groups)
 
         # Video-level split per source
@@ -518,17 +554,17 @@ def _balanced_split(master_list, val_split=0.2, num_frames=16,
         # Determine target clips per source
         # Distribute remainder to first sources so total matches exactly
         if train_size is not None:
-            _train_half = train_size // 2
-            _train_base = _train_half // n_sources
-            _train_rem  = _train_half % n_sources
+            _train_class = train_size // n_classes
+            _train_base  = _train_class // n_sources
+            _train_rem   = _train_class % n_sources
         else:
             _train_base = min(len(v) for v in source_train.values())
             _train_rem  = 0
 
         if val_size is not None:
-            _val_half = val_size // 2
-            _val_base = _val_half // n_sources
-            _val_rem  = _val_half % n_sources
+            _val_class = val_size // n_classes
+            _val_base  = _val_class // n_sources
+            _val_rem   = _val_class % n_sources
         else:
             _val_base = max(1, round(_train_base * val_split / (1 - val_split)))
             _val_rem  = 0

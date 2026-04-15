@@ -38,7 +38,9 @@ paths:
 
 model:
   clip_arch: ViT-B/16
-  class_names: ["true", "false"]
+  # Binary:     class_names: ["fake", "real"]  → num_classes: 1  (sigmoid + BCE)
+  # Multiclass: class_names: ["real", "fake_pika", "fake_sora"]  → num_classes: 3  (softmax + CE)
+  class_names: ["fake", "real"]
   head_type: deep          # "simple" (1-layer) | "deep" (3-layer)
 
 training:
@@ -48,7 +50,7 @@ training:
   num_frames: 16
   num_workers: 2
   input_dim: 512
-  num_classes: 1
+  num_classes: 1             # 1=binary (sigmoid+BCE); >=2=multiclass (softmax+CE+argmax)
   use_amp: true            # mixed precision — disable if running on CPU
   lr_scheduler: cosine     # "cosine" | "plateau" | null
   patience: 3              # early stopping epochs; null to disable
