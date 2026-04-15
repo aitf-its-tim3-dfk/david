@@ -110,48 +110,60 @@ def _expand_source_to_target(videos, target, num_frames, min_seg_frames=150, max
     return clips, deficit
 
 
-def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None, class_names=None):
+def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None,
+                  class_names=None, col_path="path", col_class="class", col_source="label"):
     """
     Load video file list from a metadata CSV.
 
-    Expects columns: 'path' (relative to base_dir), 'class' (class name string),
-    and 'label' (source name e.g. 'coin', 'SVD').
-
-    Returns a list of (abs_path, label, source_str) tuples where label is:
-      - bool (True=real, False=fake) when class_names is None  [binary legacy]
-      - int (class index into class_names list) when class_names is provided
-
     Parameters
     ----------
-    validate : bool
-        If True, open each video with DECORD and drop unreadable files.
-    clean_csv_path : str, optional
-        If set, save the validated file list as a new CSV to this path.
-        Only meaningful when validate=True.
+    col_path : str
+        CSV column name for the video file path. Default: "path".
+    col_class : str
+        CSV column name for the class label string. Default: "class".
+    col_source : str
+        CSV column name for the source/dataset name. Default: "label".
     class_names : list of str, optional
-        Ordered list of class name strings. Maps CSV 'class' column value to
-        integer index. E.g. ["real", "fake_pika", "fake_sora"] → 0, 1, 2.
-        If None, falls back to binary bool mapping ("real" → True, else → False).
+        Ordered list of class name strings → integer index mapping.
+        E.g. ["real", "fake_pika", "fake_sora"] maps to 0, 1, 2.
+        If None: binary bool mapping ("real" → True, else → False).
+    validate : bool
+        If True, open each video with DECORD and skip unreadable files.
+    clean_csv_path : str, optional
+        Save validated file list as a new CSV here. Only used when validate=True.
+
+    Returns
+    -------
+    list of (abs_path, label, source_str) tuples.
     """
     video_files = []
     skipped = 0
     with open(csv_path, "r") as f:
         rows = list(csv.DictReader(f))
 
+    if rows:
+        available = set(rows[0].keys())
+        for col, name in [(col_path, "col_path"), (col_class, "col_class")]:
+            if col not in available:
+                raise ValueError(
+                    f"Column '{col}' not found in {csv_path}. "
+                    f"Available columns: {sorted(available)}. "
+                    f"Set {name}= to match your CSV."
+                )
+
     VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
-    # Build class name → index mapping if provided
     class_to_idx = {name.strip().lower(): idx for idx, name in enumerate(class_names)} \
         if class_names is not None else None
 
     from tqdm import tqdm
     desc = "Validating videos" if validate else "Loading CSV"
     for row in tqdm(rows, desc=desc):
-        abs_path = os.path.join(base_dir, row["path"])
+        abs_path = os.path.join(base_dir, row[col_path])
         if os.path.splitext(abs_path)[1].lower() not in VIDEO_EXTENSIONS:
             skipped += 1
             continue
-        class_str = row["class"].strip().lower()
+        class_str = row[col_class].strip().lower()
         if class_to_idx is not None:
             if class_str not in class_to_idx:
                 skipped += 1
@@ -159,26 +171,23 @@ def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None, class
             label = class_to_idx[class_str]
         else:
             label = class_str == "real"  # binary legacy: bool
-        source = row.get("label", "unknown").strip()
+        source = row.get(col_source, "unknown").strip()
         if validate and not _is_valid_video(abs_path):
             skipped += 1
             continue
         video_files.append((abs_path, label, source))
 
     print(f"Loaded {len(video_files)} videos from {csv_path}" +
-          (f" ({skipped} broken/non-video files skipped)" if skipped else ""))
+          (f" ({skipped} skipped)" if skipped else ""))
 
     if clean_csv_path and validate:
         with open(clean_csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["path", "class", "label"])
+            writer.writerow([col_path, col_class, col_source])
             for abs_path, label, source in video_files:
                 rel_path = os.path.relpath(abs_path, base_dir)
-                # Write back as class name string
-                if class_names is not None:
-                    class_str_out = class_names[label]
-                else:
-                    class_str_out = "real" if label else "fake"
+                class_str_out = class_names[label] if class_names is not None \
+                    else ("real" if label else "fake")
                 writer.writerow([rel_path, class_str_out, source])
         print(f"Clean CSV saved: {clean_csv_path}")
 
@@ -293,7 +302,7 @@ class OptimizedVideoDataset(Dataset):
 
         for attempt in range(MAX_RETRIES):
             try:
-                vr = VideoReader(video_path, ctx=cpu(0))
+                vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
                 total_frames = len(vr)
 
                 if len(entry) == 5:
@@ -328,21 +337,29 @@ class OptimizedVideoDataset(Dataset):
                 return video_tensor, int(label)
 
             except Exception as e:
-                is_retryable = "Error reading" in str(e)
+                err_str = str(e)
+                # Threading/transient errors: retry but don't permanently blacklist
+                # Permanent errors: no video stream, file not found
+                is_permanent = any(x in err_str for x in [
+                    "cannot find video stream",
+                    "No such file",
+                    "Invalid data",
+                ])
 
-                if is_retryable and attempt < MAX_RETRIES - 1:
+                if not is_permanent and attempt < MAX_RETRIES - 1:
                     delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
                     print(
-                        f"[Retry {attempt + 1}/{MAX_RETRIES}] Error loading {video_path}: {e} "
+                        f"[Retry {attempt + 1}/{MAX_RETRIES}] {video_path}: {err_str[:80]} "
                         f"-- retrying in {delay:.1f}s..."
                     )
                     time.sleep(delay)
                 else:
-                    if is_retryable:
-                        print(f"[FAILED] Gave up loading {video_path} after {MAX_RETRIES} attempts: {e}")
+                    if is_permanent:
+                        print(f"[SKIP] Broken sample {video_path}: {err_str[:120]}")
+                        _broken_files.add(video_path)  # blacklist permanently
                     else:
-                        print(f"[SKIP] Broken sample {video_path}: {e}")
-                    _broken_files.add(video_path)
+                        print(f"[FAILED] Gave up on {video_path} after {MAX_RETRIES} attempts")
+                        # Don't blacklist — transient error, may succeed next epoch
                     return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
 
 
@@ -367,6 +384,9 @@ def get_train_val_loaders(
     max_seg_secs=10,
     split_cache_path=None,
     class_names=None,
+    col_path="path",
+    col_class="class",
+    col_source="label",
 ):
     """Creates stratified train and validation dataloaders.
 
@@ -383,11 +403,14 @@ def get_train_val_loaders(
     if csv_path is not None:
         if clean_csv_path and os.path.exists(clean_csv_path):
             print(f"Clean CSV found, loading from: {clean_csv_path}")
-            master_list = load_from_csv(clean_csv_path, base_dir, class_names=class_names)
+            master_list = load_from_csv(clean_csv_path, base_dir,
+                                        class_names=class_names,
+                                        col_path=col_path, col_class=col_class, col_source=col_source)
         else:
             master_list = load_from_csv(
                 csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path,
                 class_names=class_names,
+                col_path=col_path, col_class=col_class, col_source=col_source,
             )
     else:
         if not os.path.exists(cache_path):

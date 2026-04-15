@@ -51,6 +51,9 @@ _DEFAULTS = {
         "balance":      True,
         "min_seg_secs": 5,
         "max_seg_secs": 10,
+        "col_path":     "path",   # CSV column name for video file path
+        "col_class":    "class",  # CSV column name for class label
+        "col_source":   "label",  # CSV column name for source/dataset name
     },
 }
 
@@ -112,6 +115,9 @@ VAL_SIZE      = _cfg["dataset"]["val_size"]
 BALANCE       = _cfg["dataset"]["balance"]
 MIN_SEG_SECS  = _cfg["dataset"]["min_seg_secs"]
 MAX_SEG_SECS  = _cfg["dataset"]["max_seg_secs"]
+COL_PATH      = _cfg["dataset"]["col_path"]
+COL_CLASS     = _cfg["dataset"]["col_class"]
+COL_SOURCE    = _cfg["dataset"]["col_source"]
 
 # ── W&B ────────────────────────────────────────────────────────────────────────
 WANDB_ENABLED   = _cfg["wandb"]["enabled"]

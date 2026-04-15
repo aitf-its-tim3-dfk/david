@@ -62,6 +62,9 @@ dataset:
   balance: true            # true = equal clips per source within each class (no leakage)
   min_seg_secs: 5          # minimum segment duration (seconds) when splitting long videos
   max_seg_secs: 10         # maximum segment duration (seconds) when splitting long videos
+  col_path: path           # CSV column name for video file path
+  col_class: class         # CSV column name for class label string
+  col_source: label        # CSV column name for source/dataset name
 
 wandb:
   enabled: true            # set false to disable W&B logging
