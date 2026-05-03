@@ -1,0 +1,11 @@
+torch
+torchvision
+ftfy
+regex
+decord
+scikit-learn
+tqdm
+gradio
+gdown
+yacs
+scenedetect[opencv]
