@@ -712,7 +712,11 @@ class VideoDataset(Dataset):
 
     def __getitem__(self, idx):
         path, label, source, scenes = self.entries[idx]
-        scenes = scenes[:self.max_scenes]
+        if len(scenes) > self.max_scenes:
+            step = len(scenes) / self.max_scenes
+            scenes = [scenes[int(i * step)] for i in range(self.max_scenes)]
+        else:
+            scenes = scenes[:self.max_scenes]
         n_scenes = len(scenes)
 
         zero_scene = torch.zeros(self.num_frames, 3, 224, 224)
