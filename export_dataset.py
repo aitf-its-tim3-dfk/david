@@ -59,11 +59,13 @@ def export_used_videos(split_cache_path, output_dir, copy_videos=True):
 
     # Create folder structure
     for split in ("train", "val"):
-        for cls in ("real", "fake"):
+        for cls in ("real", "fake", "deepfake"):
             os.makedirs(os.path.join(output_dir, split, cls), exist_ok=True)
 
+    INT_TO_CLASS = {0: "real", 1: "fake", 2: "deepfake"}
+
     def _class_str(label):
-        return "real" if label else "fake"
+        return INT_TO_CLASS.get(int(label), "fake")
 
     # Save CSVs + optionally copy videos
     for split_name, files in [("train", train_files), ("val", val_files)]:

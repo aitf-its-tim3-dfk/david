@@ -15,6 +15,71 @@ from torchvision.transforms import v2 as transforms
 from decord import VideoReader, cpu
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+
+
+def _is_image(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _IMAGE_EXTS
+
+
+def _load_image_as_frames(path: str, num_frames: int, transform) -> torch.Tensor:
+    """Load a single image and repeat it num_frames times → (num_frames, C, H, W) uint8."""
+    from PIL import Image as PILImage
+    import torchvision.transforms.v2.functional as TF
+    img = PILImage.open(path).convert("RGB")
+    tensor = TF.to_image(img)                                  # (C, H, W) uint8
+    tensor = tensor.unsqueeze(0).repeat(num_frames, 1, 1, 1)  # (num_frames, C, H, W)
+    if transform:
+        tensor = transform(tensor)
+    return tensor
+
+
+def _uniform_frame_indices(seg_start: int, seg_end: int, num_frames: int) -> list:
+    """Sample num_frames indices uniformly within [seg_start, seg_end)."""
+    scene_len = seg_end - seg_start
+    if scene_len >= num_frames:
+        step = scene_len / num_frames
+        return [seg_start + int(i * step) for i in range(num_frames)]
+    indices = list(range(seg_start, seg_end))
+    indices += [max(seg_end - 1, seg_start)] * (num_frames - scene_len)
+    return indices
+
+
+def _get_scene_segments(video_path: str, min_scene_frames: int = 75,
+                        threshold: float = 27.0) -> list:
+    """
+    Run PySceneDetect and return [(start_frame, end_frame), ...] per scene.
+    Falls back to [(0, total_frames)] if detection fails or finds no scenes.
+    """
+    if _is_image(video_path):
+        return [(0, 1)]
+    try:
+        from scenedetect import open_video, SceneManager
+        from scenedetect.detectors import ContentDetector
+        video = open_video(video_path)
+        total = video.duration.get_frames()
+        sm = SceneManager()
+        sm.add_detector(ContentDetector(threshold=threshold))
+        sm.detect_scenes(video, show_progress=False)
+        scenes = sm.get_scene_list()
+        if not scenes:
+            return [(0, total)]
+        result = [
+            (s.get_frames(), e.get_frames())
+            for s, e in scenes
+            if (e.get_frames() - s.get_frames()) >= min_scene_frames
+        ]
+        return result if result else [(0, total)]
+    except Exception:
+        try:
+            vr = VideoReader(video_path, ctx=cpu(0))
+            n = len(vr)
+            del vr
+            return [(0, n)]
+        except Exception:
+            return [(0, 0)]
+
+
 def _is_valid_video(path):
     """Return True if DECORD can open the file, has frames, and can read one."""
     try:
@@ -133,31 +198,43 @@ def load_from_csv(csv_path, base_dir, validate=False, clean_csv_path=None):
         rows = list(csv.DictReader(f))
 
     VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    CLASS_TO_INT = {"real": 0, "fake": 1, "deepfake": 2}
 
     from tqdm import tqdm
     desc = "Validating videos" if validate else "Loading CSV"
     for row in tqdm(rows, desc=desc):
         abs_path = os.path.join(base_dir, row["path"])
-        if os.path.splitext(abs_path)[1].lower() not in VIDEO_EXTENSIONS:
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext not in VIDEO_EXTENSIONS and not _is_image(abs_path):
             skipped += 1
             continue
-        label = row["class"].strip().lower() == "real"
+        raw_class = row["class"].strip().lower()
+        label = CLASS_TO_INT.get(raw_class, 1)  # unknown class falls back to fake
         source = row.get("label", "unknown").strip()
-        if validate and not _is_valid_video(abs_path):
-            skipped += 1
-            continue
+        if validate:
+            if _is_image(abs_path):
+                try:
+                    from PIL import Image as PILImage
+                    PILImage.open(abs_path).verify()
+                except Exception:
+                    skipped += 1
+                    continue
+            elif not _is_valid_video(abs_path):
+                skipped += 1
+                continue
         video_files.append((abs_path, label, source))
 
     print(f"Loaded {len(video_files)} videos from {csv_path}" +
           (f" ({skipped} broken/non-video files skipped)" if skipped else ""))
 
     if clean_csv_path and validate:
+        INT_TO_CLASS = {0: "real", 1: "fake", 2: "deepfake"}
         with open(clean_csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["path", "class", "label"])
             for abs_path, label, source in video_files:
                 rel_path = os.path.relpath(abs_path, base_dir)
-                writer.writerow([rel_path, "real" if label else "fake", source])
+                writer.writerow([rel_path, INT_TO_CLASS.get(label, "fake"), source])
         print(f"Clean CSV saved: {clean_csv_path}")
 
     return video_files
@@ -268,6 +345,15 @@ class OptimizedVideoDataset(Dataset):
 
         if video_path in _broken_files:
             return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
+
+        if _is_image(video_path):
+            try:
+                video_tensor = _load_image_as_frames(video_path, self.num_frames, self.transform)
+                return video_tensor, int(label)
+            except Exception as e:
+                print(f"[SKIP] Broken image {video_path}: {e}")
+                _broken_files.add(video_path)
+                return torch.zeros((self.num_frames, 3, 224, 224)), int(label)
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -415,32 +501,34 @@ def get_train_val_loaders(
 
     # ── Standard split modes ──────────────────────────────────────────────────
     else:
-        real_videos = [item for item in master_list if item[1] is True]
-        fake_videos = [item for item in master_list if item[1] is False]
-        random.shuffle(real_videos)
-        random.shuffle(fake_videos)
+        from collections import defaultdict
+        class_buckets = defaultdict(list)
+        for item in master_list:
+            class_buckets[item[1]].append(item)
+        for bucket in class_buckets.values():
+            random.shuffle(bucket)
 
         if train_size is not None or val_size is not None:
-            total = len(real_videos) + len(fake_videos)
-            real_ratio = len(real_videos) / total
-            fake_ratio = len(fake_videos) / total
-
-            if val_size is not None:
-                n_val_real = min(round(val_size * real_ratio), len(real_videos))
-                n_val_fake = min(round(val_size * fake_ratio), len(fake_videos))
-            else:
-                n_val_real = int(len(real_videos) * val_split)
-                n_val_fake = int(len(fake_videos) * val_split)
-
-            val_files  = real_videos[:n_val_real] + fake_videos[:n_val_fake]
-            train_pool = real_videos[n_val_real:] + fake_videos[n_val_fake:]
+            total = len(master_list)
+            val_files = []
+            train_pool = []
+            for cls_label, videos in class_buckets.items():
+                ratio = len(videos) / total
+                if val_size is not None:
+                    n_val = min(round(val_size * ratio), len(videos))
+                else:
+                    n_val = int(len(videos) * val_split)
+                val_files.extend(videos[:n_val])
+                train_pool.extend(videos[n_val:])
             random.shuffle(train_pool)
             train_files = train_pool[:train_size] if train_size is not None else train_pool
         else:
-            real_split_idx = int(len(real_videos) * (1 - val_split))
-            fake_split_idx = int(len(fake_videos) * (1 - val_split))
-            train_files = real_videos[:real_split_idx] + fake_videos[:fake_split_idx]
-            val_files   = real_videos[real_split_idx:] + fake_videos[fake_split_idx:]
+            train_files = []
+            val_files = []
+            for cls_label, videos in class_buckets.items():
+                split_idx = int(len(videos) * (1 - val_split))
+                train_files.extend(videos[:split_idx])
+                val_files.extend(videos[split_idx:])
 
     random.shuffle(train_files)
     random.shuffle(val_files)
@@ -488,22 +576,27 @@ def _balanced_split(master_list, val_split=0.2, num_frames=16,
 
     Returns (train_files, val_files).
     """
+    INT_TO_CLASS = {0: "Real", 1: "Fake", 2: "Deepfake"}
+
     groups = defaultdict(list)
     for item in master_list:
         key = (item[1], item[2] if len(item) > 2 else "unknown")
         groups[key].append(item)
 
-    real_groups = {k: v for k, v in groups.items() if k[0] is True}
-    fake_groups = {k: v for k, v in groups.items() if k[0] is False}
+    all_class_labels = sorted({k[0] for k in groups})
+    class_groups_by_label = {
+        lbl: {k: v for k, v in groups.items() if k[0] == lbl}
+        for lbl in all_class_labels
+    }
 
     train_files = []
     val_files = []
 
-    for class_name, class_groups in [("Real", real_groups), ("Fake", fake_groups)]:
-        if not class_groups:
-            continue
-
+    for class_label in all_class_labels:
+        class_name = INT_TO_CLASS.get(class_label, str(class_label))
+        class_groups = class_groups_by_label[class_label]
         n_sources = len(class_groups)
+        n_classes = len(all_class_labels)
 
         # Video-level split per source
         source_train = {}
@@ -515,20 +608,19 @@ def _balanced_split(master_list, val_split=0.2, num_frames=16,
             source_val[key] = vids[:n_val]
             source_train[key] = vids[n_val:]
 
-        # Determine target clips per source
-        # Distribute remainder to first sources so total matches exactly
+        # Determine target clips per source (split budget equally across all classes)
         if train_size is not None:
-            _train_half = train_size // 2
-            _train_base = _train_half // n_sources
-            _train_rem  = _train_half % n_sources
+            _train_share = train_size // n_classes
+            _train_base = _train_share // n_sources
+            _train_rem  = _train_share % n_sources
         else:
             _train_base = min(len(v) for v in source_train.values())
             _train_rem  = 0
 
         if val_size is not None:
-            _val_half = val_size // 2
-            _val_base = _val_half // n_sources
-            _val_rem  = _val_half % n_sources
+            _val_share = val_size // n_classes
+            _val_base = _val_share // n_sources
+            _val_rem  = _val_share % n_sources
         else:
             _val_base = max(1, round(_train_base * val_split / (1 - val_split)))
             _val_rem  = 0
@@ -594,3 +686,170 @@ def _balanced_split(master_list, val_split=0.2, num_frames=16,
             val_files.extend(source_v_clips[key])
 
     return train_files, val_files
+
+
+# ── Scene-aware video-level dataset ──────────────────────────────────────────
+
+class VideoDataset(Dataset):
+    """
+    Video-level dataset for scene-attention training.
+
+    Each item represents one full video: returns all of its detected scenes as a
+    padded tensor (max_scenes, num_frames, C, H, W), the true label, and the
+    actual scene count (needed by SceneAttention to mask padding).
+
+    entries : list of (path, label_int, source, [(seg_start, seg_end), ...])
+    """
+
+    def __init__(self, entries, transform, num_frames: int = 16, max_scenes: int = 8):
+        self.entries = entries
+        self.transform = transform
+        self.num_frames = num_frames
+        self.max_scenes = max_scenes
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, idx):
+        path, label, source, scenes = self.entries[idx]
+        scenes = scenes[:self.max_scenes]
+        n_scenes = len(scenes)
+
+        zero_scene = torch.zeros(self.num_frames, 3, 224, 224)
+        scene_tensors = []
+
+        try:
+            if _is_image(path):
+                img_tensor = _load_image_as_frames(path, self.num_frames, self.transform)
+                scene_tensors.append(img_tensor)
+            else:
+                vr = VideoReader(path, ctx=cpu(0))
+                total_frames = len(vr)
+                for seg_start, seg_end in scenes:
+                    seg_end = min(seg_end, total_frames)
+                    if seg_end <= seg_start:
+                        scene_tensors.append(zero_scene)
+                        continue
+                    frame_indices = _uniform_frame_indices(seg_start, seg_end, self.num_frames)
+                    frames = vr.get_batch(frame_indices).asnumpy()
+                    tensor = torch.from_numpy(frames).permute(0, 3, 1, 2)
+                    if self.transform:
+                        tensor = self.transform(tensor)
+                    scene_tensors.append(tensor)
+                del vr
+        except Exception as e:
+            print(f"[VideoDataset] Error loading {path}: {e}")
+
+        # Pad with zero scenes to max_scenes
+        while len(scene_tensors) < self.max_scenes:
+            scene_tensors.append(zero_scene)
+
+        # If nothing loaded at all, n_scenes must be at least 1 to avoid -inf in attention
+        if n_scenes == 0:
+            n_scenes = 1
+
+        return torch.stack(scene_tensors), int(label), n_scenes
+
+
+def get_video_loaders(
+    transform,
+    csv_path,
+    base_dir,
+    val_split: float = 0.2,
+    batch_size: int = 4,
+    num_workers: int = 2,
+    num_frames: int = 16,
+    max_scenes: int = 8,
+    scene_threshold: float = 27.0,
+    min_scene_frames: int = 75,
+    validate: bool = False,
+    clean_csv_path: str = None,
+    split_cache_path: str = None,
+):
+    """
+    Video-level DataLoader using PySceneDetect for segment boundaries.
+
+    Returns (train_loader, val_loader, val_entries) where each entry is
+    (path, label_int, source, [(seg_start, seg_end), ...]).
+
+    Split is done at VIDEO level to prevent leakage (same video never appears
+    in both train and val).
+    """
+    from collections import defaultdict
+
+    # ── Load video list ───────────────────────────────────────────────────────
+    if clean_csv_path and os.path.exists(clean_csv_path):
+        master_list = load_from_csv(clean_csv_path, base_dir)
+    else:
+        master_list = load_from_csv(
+            csv_path, base_dir, validate=validate, clean_csv_path=clean_csv_path
+        )
+
+    # ── Load split cache if exists ────────────────────────────────────────────
+    if split_cache_path and os.path.exists(split_cache_path):
+        print(f"Split cache found, loading from: {split_cache_path}")
+        with open(split_cache_path, "r") as f:
+            cached = json.load(f)
+        train_entries = [
+            (e[0], e[1], e[2], [tuple(s) for s in e[3]]) for e in cached["train"]
+        ]
+        val_entries = [
+            (e[0], e[1], e[2], [tuple(s) for s in e[3]]) for e in cached["val"]
+        ]
+        print(f"Loaded {len(train_entries)} train, {len(val_entries)} val videos from cache.")
+    else:
+        # ── Deduplicate to video level ────────────────────────────────────────
+        video_dict = {}
+        for path, label, source in master_list:
+            if path not in video_dict:
+                video_dict[path] = (label, source)
+
+        # ── Stratified video-level split ──────────────────────────────────────
+        label_buckets = defaultdict(list)
+        for path, (label, source) in video_dict.items():
+            label_buckets[label].append((path, label, source))
+
+        train_raw, val_raw = [], []
+        for vids in label_buckets.values():
+            random.shuffle(vids)
+            n_val = max(1, int(len(vids) * val_split))
+            val_raw.extend(vids[:n_val])
+            train_raw.extend(vids[n_val:])
+
+        random.shuffle(train_raw)
+        random.shuffle(val_raw)
+        print(f"Videos: {len(train_raw)} train, {len(val_raw)} val")
+
+        # ── Scene detection ───────────────────────────────────────────────────
+        def _detect(videos_raw):
+            entries = []
+            for path, label, source in tqdm(videos_raw, desc="Scene detect"):
+                scenes = _get_scene_segments(path, min_scene_frames, scene_threshold)
+                entries.append((path, label, source, scenes))
+            return entries
+
+        print("Running scene detection on train set...")
+        train_entries = _detect(train_raw)
+        print("Running scene detection on val set...")
+        val_entries = _detect(val_raw)
+
+        # ── Save split cache ──────────────────────────────────────────────────
+        if split_cache_path:
+            os.makedirs(os.path.dirname(split_cache_path), exist_ok=True)
+            with open(split_cache_path, "w") as f:
+                json.dump({"train": train_entries, "val": val_entries}, f)
+            print(f"Split cache saved: {split_cache_path}")
+
+    train_ds = VideoDataset(train_entries, transform, num_frames, max_scenes)
+    val_ds   = VideoDataset(val_entries,   transform, num_frames, max_scenes)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+
+    return train_loader, val_loader, val_entries

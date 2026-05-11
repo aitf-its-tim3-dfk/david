@@ -8,12 +8,13 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from sklearn.metrics import classification_report
 from tqdm import tqdm
 
-from model import build_head
+from model import build_head, SceneAttention
 
 
 def set_seed(seed_value=42):
@@ -39,6 +40,23 @@ def _extract_features(feature_extractor, videos, device):
 
     image_features = image_features.view(batch_size, num_frames, -1)
     return image_features.mean(dim=1)
+
+
+def _extract_scene_features(feature_extractor, scene_stacks, device):
+    """
+    Encode all scenes of a batch of videos.
+
+    scene_stacks : (B, max_scenes, num_frames, C, H, W)
+    Returns      : (B, max_scenes, 512) — one feature vector per scene
+    """
+    scene_stacks = scene_stacks.to(device)
+    B, max_s, nf, C, H, W = scene_stacks.shape
+    flat = scene_stacks.view(B * max_s * nf, C, H, W)
+
+    with torch.no_grad():
+        feats = feature_extractor.image_encoder(flat)  # (B*max_s*nf, 512)
+
+    return feats.view(B, max_s, nf, -1).mean(dim=2)   # (B, max_s, 512)
 
 
 def _dataset_stats_table(wandb, train_files, val_files):
@@ -92,6 +110,19 @@ def _dataset_stats_table(wandb, train_files, val_files):
     })
 
 
+def _avg_prob_forward(classifier, scene_feats, n_scenes):
+    """Late fusion: classify each scene, return mean softmax probs (B, C)."""
+    B, max_s, dim = scene_feats.shape
+    all_logits = classifier(scene_feats.view(B * max_s, dim)).view(B, max_s, -1)
+    all_probs  = F.softmax(all_logits, dim=-1)
+    mask = (
+        torch.arange(max_s, device=n_scenes.device).unsqueeze(0)
+        < n_scenes.unsqueeze(1)
+    ).float()
+    avg_probs = (all_probs * mask.unsqueeze(-1)).sum(dim=1) / n_scenes.float().unsqueeze(1)
+    return avg_probs
+
+
 def _build_scheduler(optimizer, scheduler_type, num_epochs, val_loader_len):
     """Instantiate a LR scheduler by name. Returns None if scheduler_type is None."""
     if scheduler_type == "cosine":
@@ -104,10 +135,12 @@ def _build_scheduler(optimizer, scheduler_type, num_epochs, val_loader_len):
 def train_one_epoch(
     classifier, feature_extractor, train_loader,
     criterion, optimizer, device, epoch, num_epochs,
-    scaler=None,
+    scaler=None, attention=None, scene_pooling="none",
 ):
     """Runs a single training epoch. Uses AMP if scaler is provided."""
     classifier.train()
+    if attention is not None:
+        attention.train()
     running_loss = 0.0
     use_amp = scaler is not None
     total_samples = 0
@@ -115,15 +148,34 @@ def train_one_epoch(
     print(f"\n--- Epoch {epoch + 1}/{num_epochs} | Training ---")
 
     epoch_start = time.perf_counter()
-    for _, (videos, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
+    for _, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
         batch_start = time.perf_counter()
 
-        labels = labels.to(device).float().unsqueeze(1)
-        video_feature = _extract_features(feature_extractor, videos, device)
-
-        with autocast(device_type=device.type, enabled=use_amp):
-            outputs = classifier(video_feature)
-            loss = criterion(outputs, labels)
+        if scene_pooling == "attention":
+            scene_stacks, labels, n_scenes = batch
+            labels   = labels.to(device).long()
+            n_scenes = n_scenes.to(device)
+            scene_feats   = _extract_scene_features(feature_extractor, scene_stacks, device)
+            video_feature = attention(scene_feats, n_scenes)
+            with autocast(device_type=device.type, enabled=use_amp):
+                outputs = classifier(video_feature)
+                loss    = criterion(outputs, labels)
+        elif scene_pooling == "avg_prob":
+            scene_stacks, labels, n_scenes = batch
+            labels   = labels.to(device).long()
+            n_scenes = n_scenes.to(device)
+            scene_feats = _extract_scene_features(feature_extractor, scene_stacks, device)
+            with autocast(device_type=device.type, enabled=use_amp):
+                avg_probs = _avg_prob_forward(classifier, scene_feats, n_scenes)
+                loss      = F.nll_loss(avg_probs.log().clamp(min=-100), labels)
+                outputs   = avg_probs
+        else:
+            videos, labels = batch
+            labels = labels.to(device).long()
+            video_feature = _extract_features(feature_extractor, videos, device)
+            with autocast(device_type=device.type, enabled=use_amp):
+                outputs = classifier(video_feature)
+                loss    = criterion(outputs, labels)
 
         optimizer.zero_grad(set_to_none=True)
         if use_amp:
@@ -151,9 +203,12 @@ def train_one_epoch(
     return avg_loss, epoch_secs, avg_batch_ms, throughput
 
 
-def validate(classifier, feature_extractor, val_loader, criterion, device, epoch=None, num_epochs=None):
+def validate(classifier, feature_extractor, val_loader, criterion, device,
+             epoch=None, num_epochs=None, attention=None, scene_pooling="none"):
     """Runs validation and returns loss, accuracy, predictions, and labels."""
     classifier.eval()
+    if attention is not None:
+        attention.eval()
     val_loss = 0.0
     all_preds = []
     all_labels = []
@@ -162,14 +217,31 @@ def validate(classifier, feature_extractor, val_loader, criterion, device, epoch
         print(f"--- Epoch {epoch + 1}/{num_epochs} | Validation ---")
 
     with torch.no_grad():
-        for videos, labels in tqdm(val_loader, total=len(val_loader)):
-            labels = labels.to(device).float().unsqueeze(1)
-            video_feature = _extract_features(feature_extractor, videos, device)
+        for batch in tqdm(val_loader, total=len(val_loader)):
+            if scene_pooling == "attention":
+                scene_stacks, labels, n_scenes = batch
+                labels   = labels.to(device).long()
+                n_scenes = n_scenes.to(device)
+                scene_feats   = _extract_scene_features(feature_extractor, scene_stacks, device)
+                video_feature = attention(scene_feats, n_scenes)
+                outputs = classifier(video_feature)
+                val_loss += criterion(outputs, labels).item()
+            elif scene_pooling == "avg_prob":
+                scene_stacks, labels, n_scenes = batch
+                labels   = labels.to(device).long()
+                n_scenes = n_scenes.to(device)
+                scene_feats = _extract_scene_features(feature_extractor, scene_stacks, device)
+                avg_probs   = _avg_prob_forward(classifier, scene_feats, n_scenes)
+                val_loss   += F.nll_loss(avg_probs.log().clamp(min=-100), labels).item()
+                outputs     = avg_probs
+            else:
+                videos, labels = batch
+                labels = labels.to(device).long()
+                video_feature = _extract_features(feature_extractor, videos, device)
+                outputs = classifier(video_feature)
+                val_loss += criterion(outputs, labels).item()
 
-            outputs = classifier(video_feature)
-            val_loss += criterion(outputs, labels).item()
-
-            preds = torch.sigmoid(outputs) > 0.5
+            preds = torch.argmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
@@ -198,6 +270,7 @@ def run_training(
     wandb_project="david-deepfake",
     wandb_run_name=None,
     wandb_extra_config=None,
+    scene_pooling="none",
 ):
     """Full training + evaluation pipeline.
 
@@ -229,17 +302,18 @@ def run_training(
     if use_wandb:
         import wandb
         run_config = {
-            "head_type":    head_type,
-            "lr":           lr,
-            "num_epochs":   num_epochs,
-            "input_dim":    input_dim,
-            "num_classes":  num_classes,
-            "use_amp":      use_amp,
-            "lr_scheduler": lr_scheduler,
-            "patience":     patience,
-            "train_size":   len(train_loader.dataset),
-            "val_size":     len(val_loader.dataset),
-            "batch_size":   train_loader.batch_size,
+            "head_type":      head_type,
+            "lr":             lr,
+            "num_epochs":     num_epochs,
+            "input_dim":      input_dim,
+            "num_classes":    num_classes,
+            "use_amp":        use_amp,
+            "lr_scheduler":   lr_scheduler,
+            "patience":       patience,
+            "scene_pooling":  scene_pooling,
+            "train_size":     len(train_loader.dataset),
+            "val_size":       len(val_loader.dataset),
+            "batch_size":     train_loader.batch_size,
         }
         if wandb_extra_config:
             run_config.update(wandb_extra_config)
@@ -254,8 +328,16 @@ def run_training(
     classifier = build_head(head_type=head_type, input_dim=input_dim, num_classes=num_classes)
     classifier.to(device)
 
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(classifier.parameters(), lr=lr)
+    attention = None
+    if scene_pooling == "attention":
+        print("Creating SceneAttention module.")
+        attention = SceneAttention(dim=input_dim).to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    params = list(classifier.parameters())
+    if attention is not None:
+        params += list(attention.parameters())
+    optimizer = optim.AdamW(params, lr=lr)
     scaler = GradScaler(device=device.type) if use_amp else None
     scheduler = _build_scheduler(optimizer, lr_scheduler, num_epochs, len(val_loader))
 
@@ -269,13 +351,14 @@ def run_training(
         train_loss, epoch_secs, avg_batch_ms, throughput = train_one_epoch(
             classifier, feature_extractor, train_loader,
             criterion, optimizer, device, epoch, num_epochs,
-            scaler=scaler,
+            scaler=scaler, attention=attention, scene_pooling=scene_pooling,
         )
         total_train_secs += epoch_secs
 
         val_loss, val_accuracy, _, _ = validate(
             classifier, feature_extractor, val_loader,
-            criterion, device, epoch, num_epochs,
+            criterion, device, epoch, num_epochs, attention=attention,
+            scene_pooling=scene_pooling,
         )
 
         # LR scheduler step
@@ -307,6 +390,9 @@ def run_training(
             best_val_accuracy = val_accuracy
             epochs_no_improve = 0
             torch.save(classifier.state_dict(), save_path)
+            if attention is not None:
+                attn_path = save_path.replace(".pt", "_attention.pt")
+                torch.save(attention.state_dict(), attn_path)
             print(f"New best model saved with accuracy: {best_val_accuracy * 100:.2f}%")
             if use_wandb:
                 wandb.run.summary["best_val_accuracy"] = best_val_accuracy
@@ -322,13 +408,17 @@ def run_training(
     print("\n--- Training Complete ---")
     print(f"Loading best model from {save_path} for final report...")
     classifier.load_state_dict(torch.load(save_path, weights_only=True))
+    if attention is not None:
+        attn_path = save_path.replace(".pt", "_attention.pt")
+        attention.load_state_dict(torch.load(attn_path, weights_only=True))
 
     _, _, all_preds, all_labels = validate(
-        classifier, feature_extractor, val_loader, criterion, device,
+        classifier, feature_extractor, val_loader, criterion, device, attention=attention,
+        scene_pooling=scene_pooling,
     )
 
     print("\n--- Final Performance Report (on validation set) ---")
-    target_names = ["Fake (0)", "Real (1)"]
+    target_names = ["Real (0)", "Fake (1)", "Deepfake (2)"]
     print(classification_report(all_labels, all_preds, target_names=target_names))
 
     # ── W&B artifact + finish ─────────────────────────────────────────────────
@@ -348,4 +438,4 @@ def run_training(
         wandb_run_id = wandb.run.id
         # Keep run open — evaluate() will log to the same run, then finish
 
-    return classifier, wandb_run_id
+    return classifier, attention, wandb_run_id

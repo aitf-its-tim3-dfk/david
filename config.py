@@ -27,7 +27,7 @@ _DEFAULTS = {
     },
     "model": {
         "clip_arch":    "ViT-B/16",
-        "class_names":  ["true", "false"],
+        "class_names":  ["real", "fake", "deepfake"],
         "head_type":    "deep",
     },
     "training": {
@@ -37,7 +37,7 @@ _DEFAULTS = {
         "num_frames":    16,
         "num_workers":   2,
         "input_dim":     512,
-        "num_classes":   1,
+        "num_classes":   3,
         "use_amp":       True,
         "lr_scheduler":  "cosine",
         "patience":      3,
@@ -46,9 +46,12 @@ _DEFAULTS = {
         "val_split":    0.2,
         "train_size":   None,
         "val_size":     None,
-        "balance":      True,
-        "min_seg_secs": 5,
-        "max_seg_secs": 10,
+        "balance":           True,
+        "min_seg_secs":      5,
+        "max_seg_secs":      10,
+        "scene_pooling":     "attention",
+        "scene_threshold":   27.0,
+        "max_scenes":        8,
     },
 }
 
@@ -107,9 +110,12 @@ PATIENCE       = _cfg["training"]["patience"]
 VAL_SPLIT     = _cfg["dataset"]["val_split"]
 TRAIN_SIZE    = _cfg["dataset"]["train_size"]
 VAL_SIZE      = _cfg["dataset"]["val_size"]
-BALANCE       = _cfg["dataset"]["balance"]
-MIN_SEG_SECS  = _cfg["dataset"]["min_seg_secs"]
-MAX_SEG_SECS  = _cfg["dataset"]["max_seg_secs"]
+BALANCE           = _cfg["dataset"]["balance"]
+MIN_SEG_SECS      = _cfg["dataset"]["min_seg_secs"]
+MAX_SEG_SECS      = _cfg["dataset"]["max_seg_secs"]
+SCENE_POOLING     = _cfg["dataset"]["scene_pooling"]
+SCENE_THRESHOLD   = _cfg["dataset"]["scene_threshold"]
+MAX_SCENES        = _cfg["dataset"]["max_scenes"]
 
 # ── W&B ────────────────────────────────────────────────────────────────────────
 WANDB_ENABLED   = _cfg["wandb"]["enabled"]

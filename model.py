@@ -58,6 +58,31 @@ class DeepHead(nn.Module):
         return x
 
 
+class SceneAttention(nn.Module):
+    """
+    Learns to weight scene vectors before aggregation.
+    Input : (B, max_scenes, dim) + (B,) n_scenes mask
+    Output: (B, dim) weighted sum
+    Only 513 parameters — one linear layer + bias.
+    """
+
+    def __init__(self, dim: int = 512):
+        super().__init__()
+        self.score = nn.Linear(dim, 1)
+
+    def forward(self, scene_vecs: torch.Tensor, n_scenes: torch.Tensor) -> torch.Tensor:
+        # scene_vecs : (B, max_scenes, dim)
+        # n_scenes   : (B,) — actual scene count per video (padding is zeroed)
+        scores = self.score(scene_vecs).squeeze(-1)           # (B, max_scenes)
+        mask = (
+            torch.arange(scene_vecs.size(1), device=scene_vecs.device)
+            .unsqueeze(0) < n_scenes.unsqueeze(1)
+        )
+        scores = scores.masked_fill(~mask, float("-inf"))
+        weights = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B, max_scenes, 1)
+        return (weights * scene_vecs).sum(dim=1)              # (B, dim)
+
+
 _HEADS = {
     "simple": SimpleHead,
     "deep": DeepHead,

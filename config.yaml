@@ -38,7 +38,7 @@ paths:
 
 model:
   clip_arch: ViT-B/16
-  class_names: ["true", "false"]
+  class_names: ["real", "fake", "deepfake"]
   head_type: deep          # "simple" (1-layer) | "deep" (3-layer)
 
 training:
@@ -48,7 +48,7 @@ training:
   num_frames: 16
   num_workers: 2
   input_dim: 512
-  num_classes: 1
+  num_classes: 3
   use_amp: true            # mixed precision — disable if running on CPU
   lr_scheduler: cosine     # "cosine" | "plateau" | null
   patience: 3              # early stopping epochs; null to disable
@@ -60,6 +60,9 @@ dataset:
   balance: true            # true = equal clips per source within each class (no leakage)
   min_seg_secs: 5          # minimum segment duration (seconds) when splitting long videos
   max_seg_secs: 10         # maximum segment duration (seconds) when splitting long videos
+  scene_pooling: attention  # "none" | "attention" | "avg_prob"
+  scene_threshold: 27.0    # ContentDetector sensitivity (lower = more scenes)
+  max_scenes: 8            # cap scenes per video to avoid memory issues
 
 wandb:
   enabled: true            # set false to disable W&B logging
