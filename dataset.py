@@ -18,6 +18,24 @@ from decord import VideoReader, cpu
 MAX_RETRIES = 15
 RETRY_BASE_DELAY = 1  # seconds
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+
+
+def _is_image(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _IMAGE_EXTS
+
+
+def _load_image_as_frames(path: str, num_frames: int, transform) -> torch.Tensor:
+    import numpy as np
+    from PIL import Image as PILImage
+    img = PILImage.open(path).convert("RGB")
+    tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1)  # (C, H, W) uint8
+    tensor = tensor.unsqueeze(0).repeat(num_frames, 1, 1, 1)   # (N, C, H, W)
+    if transform:
+        tensor = transform(tensor)
+    return tensor
+
+
 # Sampling strategy constants
 STRATEGY_CONTIGUOUS = "contiguous"
 STRATEGY_SCATTERED = "scattered"
@@ -122,12 +140,19 @@ class OptimizedVideoDataset(Dataset):
     def __getitem__(self, idx):
         video_path, label, source = self.video_files[idx]
 
+        if _is_image(video_path):
+            try:
+                return _load_image_as_frames(video_path, self.num_frames, self.transform), label
+            except Exception as e:
+                print(f"[SKIP] Broken image {video_path}: {e}")
+                return torch.zeros((self.num_frames, 3, 224, 224)), label
+
+        strategy = self._pick_strategy()
         for attempt in range(MAX_RETRIES):
             try:
                 vr = VideoReader(video_path, ctx=cpu(0))
                 total_frames = len(vr)
 
-                strategy = self._pick_strategy()
                 frame_indices = self._sample_frames(vr, total_frames, strategy)
 
                 video_frames = vr.get_batch(frame_indices).asnumpy()
